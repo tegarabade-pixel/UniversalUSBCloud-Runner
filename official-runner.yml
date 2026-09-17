@@ -1,0 +1,2287 @@
+name: Universal USB Cloud - Official Reusable Runner v2
+
+on:
+  workflow_call:
+    inputs:
+      pair_code:
+        description: "Pair Code dari APK Universal USB Cloud"
+        required: true
+        type: string
+      keep_alive_minutes:
+        description: "Windows cloud hidup berapa menit"
+        required: true
+        default: "120"
+        type: string
+    secrets:
+      UUC_TURN_URL:
+        required: false
+      UUC_TURN_USERNAME:
+        required: false
+      UUC_TURN_CREDENTIAL:
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  windows-cloud:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      ROOM: ${{ inputs.pair_code }}
+      KEEP: ${{ inputs.keep_alive_minutes }}
+      SIGNAL_URL: wss://universal-usb-signal.reiseakari.workers.dev/ws
+      GH_TOKEN: ${{ github.token }}
+      UUC_TURN_URL: ${{ secrets.UUC_TURN_URL }}
+      UUC_TURN_USERNAME: ${{ secrets.UUC_TURN_USERNAME }}
+      UUC_TURN_CREDENTIAL: ${{ secrets.UUC_TURN_CREDENTIAL }}
+
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install latest usbip-win2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
+          $headers = @{
+            "Accept" = "application/vnd.github+json"
+            "Authorization" = "Bearer $env:GH_TOKEN"
+            "X-GitHub-Api-Version" = "2022-11-28"
+            "User-Agent" = "Universal-USB-Cloud"
+          }
+
+          $release = Invoke-RestMethod -Headers $headers `
+            -Uri "https://api.github.com/repos/vadimgrn/usbip-win2/releases/latest"
+
+          $asset = $release.assets |
+            Where-Object { $_.name -match '(?i)-x64\.exe$' } |
+            Select-Object -First 1
+
+          if (-not $asset) { throw "usbip-win2 x64 installer tidak ditemukan" }
+
+          $installer = Join-Path $env:RUNNER_TEMP $asset.name
+          Invoke-WebRequest -UseBasicParsing `
+            -Headers @{"Authorization"="Bearer $env:GH_TOKEN";"User-Agent"="Universal-USB-Cloud"} `
+            -Uri $asset.browser_download_url -OutFile $installer
+
+          $p = Start-Process -FilePath $installer `
+            -ArgumentList @("/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-") `
+            -PassThru
+
+          $deadline = (Get-Date).AddSeconds(120)
+          while (-not $p.HasExited -and (Get-Date) -lt $deadline) {
+            Start-Sleep 2
+            $p.Refresh()
+          }
+
+          $usbip = @(
+            "C:\Program Files\USBip\usbip.exe",
+            "C:\Program Files (x86)\USBip\usbip.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $usbip) {
+            $f = Get-ChildItem "C:\Program Files" -Filter usbip.exe -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if ($f) { $usbip = $f.FullName }
+          }
+
+          if (-not $usbip) { throw "usbip.exe tidak ditemukan setelah install" }
+          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+
+          "USBIP_EXE=$usbip" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+          Write-Host "usbip-win2: $usbip"
+
+      - name: Prepare native WebRTC Windows desktop host
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
+          # Keep the Windows audio stack enabled. If the hosted VM exposes no render
+          # endpoint, the WebRTC host stays alive and sends silence instead of failing.
+          foreach ($svc in @("AudioEndpointBuilder","Audiosrv")) {
+            try { Set-Service $svc -StartupType Automatic -ErrorAction SilentlyContinue } catch {}
+            try { Start-Service $svc -ErrorAction SilentlyContinue } catch {}
+          }
+
+          python -m pip install --disable-pip-version-check --quiet `
+            "aiortc==1.15.0" "mss==10.2.0" "numpy>=2.0,<3" `
+            "websockets>=14,<16" "PyAudioWPatch==0.2.12.8"
+
+          $deskDir = Join-Path $env:RUNNER_TEMP "uuc-native-desktop"
+          New-Item -ItemType Directory -Path $deskDir -Force | Out-Null
+          $hostPy = Join-Path $deskDir "uuc_webrtc_host.py"
+
+          @'
+          """Universal USB Cloud v2.6.1 native Windows desktop host.
+          
+          Transport:
+            aiortc WebRTC (DTLS-SRTP/SCTP)
+          Media:
+            desktop -> H264/VP8 negotiated by WebRTC
+            WASAPI loopback -> Opus when a render endpoint exists
+          Input:
+            unordered/no-retry data channel: motion, wheel, touch move
+            reliable data channel: buttons, keyboard, text
+          
+          The host listens only on 127.0.0.1:8765 for signaling from the already
+          OIDC-authenticated UUC Go relay agent. It never opens an Internet-facing port.
+          """
+          from __future__ import annotations
+          
+          import asyncio
+          import ctypes
+          import fractions
+          import json
+          import logging
+          import os
+          import sys
+          import time
+          from ctypes import wintypes
+          from typing import Any, Optional
+          
+          import av
+          import mss
+          import numpy as np
+          import websockets
+          from aiortc import (
+              AudioStreamTrack,
+              RTCConfiguration,
+              RTCIceServer,
+              RTCPeerConnection,
+              RTCSessionDescription,
+              VideoStreamTrack,
+          )
+          from aiortc.sdp import candidate_from_sdp
+          
+          try:
+              import pyaudiowpatch as pyaudio
+          except Exception:
+              pyaudio = None
+          
+          LOG = logging.getLogger("uuc-desktop")
+          logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+          
+          HOST = "127.0.0.1"
+          PORT = int(os.environ.get("UUC_DESKTOP_IPC_PORT", "8765"))
+          TARGET_W = max(640, int(os.environ.get("UUC_DESKTOP_WIDTH", "1280")))
+          TARGET_H = max(360, int(os.environ.get("UUC_DESKTOP_HEIGHT", "720")))
+          TARGET_FPS = max(15, min(60, int(os.environ.get("UUC_DESKTOP_FPS", "30"))))
+          
+          # ---------------------------------------------------------------------------
+          # Win32 input
+          # ---------------------------------------------------------------------------
+          if sys.platform != "win32":
+              raise RuntimeError("uuc_webrtc_host.py is Windows-only")
+          
+          user32 = ctypes.WinDLL("user32", use_last_error=True)
+          
+          INPUT_MOUSE = 0
+          INPUT_KEYBOARD = 1
+          MOUSEEVENTF_MOVE = 0x0001
+          MOUSEEVENTF_LEFTDOWN = 0x0002
+          MOUSEEVENTF_LEFTUP = 0x0004
+          MOUSEEVENTF_RIGHTDOWN = 0x0008
+          MOUSEEVENTF_RIGHTUP = 0x0010
+          MOUSEEVENTF_MIDDLEDOWN = 0x0020
+          MOUSEEVENTF_MIDDLEUP = 0x0040
+          MOUSEEVENTF_XDOWN = 0x0080
+          MOUSEEVENTF_XUP = 0x0100
+          MOUSEEVENTF_WHEEL = 0x0800
+          MOUSEEVENTF_HWHEEL = 0x1000
+          MOUSEEVENTF_ABSOLUTE = 0x8000
+          KEYEVENTF_KEYUP = 0x0002
+          KEYEVENTF_UNICODE = 0x0004
+          XBUTTON1 = 0x0001
+          XBUTTON2 = 0x0002
+          WHEEL_DELTA = 120
+          
+          SM_CXSCREEN = 0
+          SM_CYSCREEN = 1
+          
+          ULONG_PTR = wintypes.WPARAM
+          
+          
+          class MOUSEINPUT(ctypes.Structure):
+              _fields_ = [
+                  ("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                  ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR),
+              ]
+          
+          
+          class KEYBDINPUT(ctypes.Structure):
+              _fields_ = [
+                  ("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                  ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR),
+              ]
+          
+          
+          class HARDWAREINPUT(ctypes.Structure):
+              _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+          
+          
+          class INPUT_UNION(ctypes.Union):
+              _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+          
+          
+          class INPUT(ctypes.Structure):
+              _anonymous_ = ("u",)
+              _fields_ = [("type", wintypes.DWORD), ("u", INPUT_UNION)]
+          
+          
+          def _send_input(inp: INPUT) -> bool:
+              return user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) == 1
+          
+          
+          def mouse(flags: int, dx: int = 0, dy: int = 0, data: int = 0) -> None:
+              inp = INPUT(type=INPUT_MOUSE)
+              inp.mi = MOUSEINPUT(dx, dy, data & 0xFFFFFFFF, flags, 0, 0)
+              _send_input(inp)
+          
+          
+          def key_vk(vk: int, down: bool) -> None:
+              inp = INPUT(type=INPUT_KEYBOARD)
+              inp.ki = KEYBDINPUT(vk & 0xFFFF, 0, 0 if down else KEYEVENTF_KEYUP, 0, 0)
+              _send_input(inp)
+          
+          
+          def text_unicode(text: str) -> None:
+              raw = text.encode("utf-16-le", errors="surrogatepass")
+              for i in range(0, len(raw), 2):
+                  unit = raw[i] | (raw[i + 1] << 8)
+                  down = INPUT(type=INPUT_KEYBOARD)
+                  down.ki = KEYBDINPUT(0, unit, KEYEVENTF_UNICODE, 0, 0)
+                  up = INPUT(type=INPUT_KEYBOARD)
+                  up.ki = KEYBDINPUT(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
+                  _send_input(down)
+                  _send_input(up)
+          
+          
+          # Android KeyEvent keyCode -> Windows VK. Printable IME text takes the Unicode path.
+          ANDROID_VK: dict[int, int] = {
+              4: 0x1B,  # BACK -> ESC when sent as a physical key
+              19: 0x26, 20: 0x28, 21: 0x25, 22: 0x27,
+              23: 0x0D, 61: 0x09, 62: 0x20, 66: 0x0D, 67: 0x08,
+              92: 0x21, 93: 0x22, 122: 0x24, 123: 0x23, 112: 0x2E, 124: 0x2D,
+              111: 0x1B,
+              113: 0x11, 114: 0x11,  # CTRL
+              57: 0x12, 58: 0x12,    # ALT
+              59: 0x10, 60: 0x10,    # SHIFT
+              117: 0x5B, 118: 0x5C,  # META / Win
+              115: 0x14, 116: 0x91, 143: 0x90,  # caps/scroll/num lock
+              120: 0x2C, 121: 0x91,             # print screen / break-ish fallback
+              131: 0x70, 132: 0x71, 133: 0x72, 134: 0x73, 135: 0x74, 136: 0x75,
+              137: 0x76, 138: 0x77, 139: 0x78, 140: 0x79, 141: 0x7A, 142: 0x7B,
+          }
+          for i in range(26):
+              ANDROID_VK[29 + i] = 0x41 + i
+          for i in range(10):
+              ANDROID_VK[7 + i] = 0x30 + i
+          ANDROID_VK.update({
+              68: 0xC0, 69: 0xBD, 70: 0xBB, 71: 0xDB, 72: 0xDD, 73: 0xDC,
+              74: 0xBA, 75: 0xDE, 76: 0xBC, 77: 0xBE, 78: 0xBF,
+              144: 0x60, 145: 0x61, 146: 0x62, 147: 0x63, 148: 0x64,
+              149: 0x65, 150: 0x66, 151: 0x67, 152: 0x68, 153: 0x69,
+              154: 0x6F, 155: 0x6A, 156: 0x6D, 157: 0x6B, 158: 0x6E, 160: 0x0D,
+          })
+          
+          
+          # ---------------------------------------------------------------------------
+          # Native Direct Touch injection, with mouse fallback if the host forbids it.
+          # ---------------------------------------------------------------------------
+          PT_TOUCH = 0x00000002
+          POINTER_FLAG_NEW = 0x00000001
+          POINTER_FLAG_INRANGE = 0x00000002
+          POINTER_FLAG_INCONTACT = 0x00000004
+          POINTER_FLAG_FIRSTBUTTON = 0x00000010
+          POINTER_FLAG_DOWN = 0x00010000
+          POINTER_FLAG_UPDATE = 0x00020000
+          POINTER_FLAG_UP = 0x00040000
+          TOUCH_MASK_CONTACTAREA = 0x00000001
+          TOUCH_MASK_ORIENTATION = 0x00000002
+          TOUCH_MASK_PRESSURE = 0x00000004
+          TOUCH_FEEDBACK_DEFAULT = 0x1
+          
+          
+          class POINT(ctypes.Structure):
+              _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+          
+          
+          class RECT(ctypes.Structure):
+              _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG), ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+          
+          
+          class POINTER_INFO(ctypes.Structure):
+              _fields_ = [
+                  ("pointerType", wintypes.DWORD), ("pointerId", wintypes.UINT), ("frameId", wintypes.UINT),
+                  ("pointerFlags", wintypes.DWORD), ("sourceDevice", wintypes.HANDLE), ("hwndTarget", wintypes.HWND),
+                  ("ptPixelLocation", POINT), ("ptHimetricLocation", POINT), ("ptPixelLocationRaw", POINT),
+                  ("ptHimetricLocationRaw", POINT), ("dwTime", wintypes.DWORD), ("historyCount", wintypes.UINT),
+                  ("InputData", ctypes.c_int32), ("dwKeyStates", wintypes.DWORD),
+                  ("PerformanceCount", ctypes.c_uint64), ("ButtonChangeType", wintypes.DWORD),
+              ]
+          
+          
+          class POINTER_TOUCH_INFO(ctypes.Structure):
+              _fields_ = [
+                  ("pointerInfo", POINTER_INFO), ("touchFlags", wintypes.DWORD), ("touchMask", wintypes.DWORD),
+                  ("rcContact", RECT), ("rcContactRaw", RECT), ("orientation", wintypes.UINT), ("pressure", wintypes.UINT),
+              ]
+          
+          
+          _TOUCH_OK = False
+          try:
+              user32.InitializeTouchInjection.argtypes = [wintypes.UINT, wintypes.DWORD]
+              user32.InitializeTouchInjection.restype = wintypes.BOOL
+              user32.InjectTouchInput.argtypes = [wintypes.UINT, ctypes.POINTER(POINTER_TOUCH_INFO)]
+              user32.InjectTouchInput.restype = wintypes.BOOL
+              _TOUCH_OK = bool(user32.InitializeTouchInjection(10, TOUCH_FEEDBACK_DEFAULT))
+          except Exception:
+              _TOUCH_OK = False
+          
+          
+          def screen_size() -> tuple[int, int]:
+              return max(1, user32.GetSystemMetrics(SM_CXSCREEN)), max(1, user32.GetSystemMetrics(SM_CYSCREEN))
+          
+          
+          def inject_touch(contacts: list[dict[str, Any]]) -> None:
+              global _TOUCH_OK
+              sw, sh = screen_size()
+              if not contacts:
+                  return
+              if not _TOUCH_OK:
+                  c = contacts[0]
+                  x = int(max(0.0, min(1.0, float(c.get("x", 0)))) * 65535)
+                  y = int(max(0.0, min(1.0, float(c.get("y", 0)))) * 65535)
+                  mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, x, y)
+                  st = c.get("state")
+                  if st == "down": mouse(MOUSEEVENTF_LEFTDOWN)
+                  elif st == "up": mouse(MOUSEEVENTF_LEFTUP)
+                  return
+          
+              infos = (POINTER_TOUCH_INFO * len(contacts))()
+              for i, c in enumerate(contacts):
+                  x = int(max(0.0, min(1.0, float(c.get("x", 0.0)))) * (sw - 1))
+                  y = int(max(0.0, min(1.0, float(c.get("y", 0.0)))) * (sh - 1))
+                  state = str(c.get("state", "move"))
+                  flags = POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_FIRSTBUTTON
+                  if state == "down": flags |= POINTER_FLAG_NEW | POINTER_FLAG_DOWN
+                  elif state == "up": flags = POINTER_FLAG_UP
+                  else: flags |= POINTER_FLAG_UPDATE
+                  p = POINTER_INFO()
+                  p.pointerType = PT_TOUCH
+                  p.pointerId = max(1, int(c.get("id", i + 1)))
+                  p.pointerFlags = flags
+                  p.ptPixelLocation = POINT(x, y)
+                  p.ptPixelLocationRaw = POINT(x, y)
+                  t = POINTER_TOUCH_INFO()
+                  t.pointerInfo = p
+                  t.touchFlags = 0
+                  t.touchMask = TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE
+                  size = max(0.0, min(1.0, float(c.get("size", 0.03))))
+                  radius = max(3, int(size * min(sw, sh) * 0.04))
+                  t.rcContact = RECT(x - radius, y - radius, x + radius, y + radius)
+                  t.rcContactRaw = t.rcContact
+                  t.orientation = 90
+                  t.pressure = int(max(0.0, min(1.0, float(c.get("pressure", 0.5)))) * 1024)
+                  infos[i] = t
+              if not user32.InjectTouchInput(len(contacts), infos):
+                  LOG.warning("InjectTouchInput failed winerr=%s; falling back to mouse", ctypes.get_last_error())
+                  _TOUCH_OK = False
+                  inject_touch(contacts)
+          
+          
+          class InputInjector:
+              def handle(self, obj: dict[str, Any]) -> None:
+                  typ = obj.get("type")
+                  sw, sh = screen_size()
+                  if typ == "mouse-relative":
+                      # Fractions of the Android viewport -> fractions of the remote desktop.
+                      dx = int(float(obj.get("dx", 0.0)) * sw * 1.35)
+                      dy = int(float(obj.get("dy", 0.0)) * sh * 1.35)
+                      mouse(MOUSEEVENTF_MOVE, dx, dy)
+                  elif typ == "mouse-absolute":
+                      x = int(max(0.0, min(1.0, float(obj.get("x", 0.0)))) * 65535)
+                      y = int(max(0.0, min(1.0, float(obj.get("y", 0.0)))) * 65535)
+                      mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, x, y)
+                  elif typ == "mouse-button":
+                      self.button(str(obj.get("button", "left")), bool(obj.get("down", False)))
+                  elif typ == "click":
+                      button = str(obj.get("button", "left"))
+                      for _ in range(max(1, min(3, int(obj.get("count", 1))))):
+                          self.button(button, True); self.button(button, False)
+                  elif typ == "wheel":
+                      v = float(obj.get("v", 0.0))
+                      h = float(obj.get("h", 0.0))
+                      if "dy" in obj: v = float(obj.get("dy", 0.0)) * 8.0
+                      if abs(v) > 0.001: mouse(MOUSEEVENTF_WHEEL, data=int(v * WHEEL_DELTA))
+                      if abs(h) > 0.001: mouse(MOUSEEVENTF_HWHEEL, data=int(h * WHEEL_DELTA))
+                  elif typ == "key":
+                      keycode = int(obj.get("keyCode", -1))
+                      vk = ANDROID_VK.get(keycode)
+                      if vk is not None:
+                          key_vk(vk, str(obj.get("action", "down")) == "down")
+                  elif typ == "text":
+                      text_unicode(str(obj.get("text", "")))
+                  elif typ == "touch":
+                      contacts = obj.get("contacts")
+                      if isinstance(contacts, list): inject_touch(contacts)
+                  elif typ == "release-all":
+                      # Defensive reset when Android loses focus/reconnects, preventing stuck
+                      # Ctrl/Alt/Shift/Win or mouse buttons after a packet/session interruption.
+                      for vk in (0x10, 0x11, 0x12, 0x5B, 0x5C):
+                          key_vk(vk, False)
+                      mouse(MOUSEEVENTF_LEFTUP)
+                      mouse(MOUSEEVENTF_RIGHTUP)
+                      mouse(MOUSEEVENTF_MIDDLEUP)
+                      mouse(MOUSEEVENTF_XUP, data=XBUTTON1)
+                      mouse(MOUSEEVENTF_XUP, data=XBUTTON2)
+          
+              @staticmethod
+              def button(name: str, down: bool) -> None:
+                  table = {
+                      "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, 0),
+                      "right": (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, 0),
+                      "middle": (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, 0),
+                      "x1": (MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, XBUTTON1),
+                      "x2": (MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, XBUTTON2),
+                  }
+                  a, b, data = table.get(name, table["left"])
+                  mouse(a if down else b, data=data)
+          
+          
+          # ---------------------------------------------------------------------------
+          # Media tracks
+          # ---------------------------------------------------------------------------
+          class DesktopVideoTrack(VideoStreamTrack):
+              def __init__(self) -> None:
+                  super().__init__()
+                  self.sct = mss.mss()
+                  if len(self.sct.monitors) < 2:
+                      raise RuntimeError("No Windows desktop monitor available")
+                  self.monitor = self.sct.monitors[1]
+                  try:
+                      self.sct.with_cursor = True
+                  except Exception:
+                      pass
+                  self._start = time.monotonic()
+                  self._seq = 0
+          
+              async def recv(self) -> av.VideoFrame:
+                  interval = 1.0 / TARGET_FPS
+                  target = self._start + self._seq * interval
+                  now = time.monotonic()
+                  if target > now:
+                      await asyncio.sleep(target - now)
+                  # If the encoder stalled, drop old frame times instead of building latency.
+                  now = time.monotonic()
+                  if now - target > interval * 2:
+                      self._seq = int((now - self._start) / interval)
+                  self._seq += 1
+                  shot = self.sct.grab(self.monitor)
+                  arr = np.asarray(shot, dtype=np.uint8)
+                  frame = av.VideoFrame.from_ndarray(arr, format="bgra")
+                  src_aspect = frame.width / max(1, frame.height)
+                  tw = TARGET_W
+                  th = TARGET_H
+                  if abs((tw / th) - src_aspect) > 0.01:
+                      if tw / th > src_aspect: tw = int(th * src_aspect) // 2 * 2
+                      else: th = int(tw / src_aspect) // 2 * 2
+                  frame = frame.reformat(width=max(2, tw), height=max(2, th), format="yuv420p")
+                  frame.pts = int((time.monotonic() - self._start) * 90000)
+                  frame.time_base = fractions.Fraction(1, 90000)
+                  return frame
+          
+          
+          class LoopbackAudioTrack(AudioStreamTrack):
+              SAMPLE_RATE = 48000
+              SAMPLES = 960  # 20 ms
+          
+              def __init__(self) -> None:
+                  super().__init__()
+                  self.pa = None
+                  self.stream = None
+                  self.channels = 2
+                  self._pts = 0
+                  self.available = False
+                  if pyaudio is None:
+                      LOG.warning("PyAudioWPatch unavailable; audio fallback = silence")
+                      return
+                  try:
+                      self.pa = pyaudio.PyAudio()
+                      dev = self.pa.get_default_wasapi_loopback()
+                      self.channels = max(1, min(2, int(dev.get("maxInputChannels", 2))))
+                      rate = int(dev.get("defaultSampleRate", self.SAMPLE_RATE))
+                      self.SAMPLE_RATE = rate if rate > 0 else 48000
+                      self.SAMPLES = max(160, int(self.SAMPLE_RATE * 0.02))
+                      self.stream = self.pa.open(
+                          format=pyaudio.paInt16,
+                          channels=self.channels,
+                          rate=self.SAMPLE_RATE,
+                          input=True,
+                          input_device_index=int(dev["index"]),
+                          frames_per_buffer=self.SAMPLES,
+                      )
+                      self.available = True
+                      LOG.info("WASAPI loopback: %s rate=%s channels=%s", dev.get("name"), self.SAMPLE_RATE, self.channels)
+                  except Exception as exc:
+                      LOG.warning("WASAPI loopback unavailable: %s; audio fallback = silence", exc)
+                      self.close_audio()
+          
+              async def recv(self) -> av.AudioFrame:
+                  if self.available and self.stream is not None:
+                      try:
+                          data = await asyncio.to_thread(self.stream.read, self.SAMPLES, False)
+                      except Exception:
+                          data = bytes(self.SAMPLES * self.channels * 2)
+                  else:
+                      await asyncio.sleep(self.SAMPLES / self.SAMPLE_RATE)
+                      data = bytes(self.SAMPLES * self.channels * 2)
+                  layout = "mono" if self.channels == 1 else "stereo"
+                  frame = av.AudioFrame(format="s16", layout=layout, samples=self.SAMPLES)
+                  frame.planes[0].update(data[: frame.planes[0].buffer_size].ljust(frame.planes[0].buffer_size, b"\x00"))
+                  frame.sample_rate = self.SAMPLE_RATE
+                  frame.pts = self._pts
+                  frame.time_base = fractions.Fraction(1, self.SAMPLE_RATE)
+                  self._pts += self.SAMPLES
+                  return frame
+          
+              def close_audio(self) -> None:
+                  try:
+                      if self.stream is not None: self.stream.close()
+                  except Exception:
+                      pass
+                  try:
+                      if self.pa is not None: self.pa.terminate()
+                  except Exception:
+                      pass
+                  self.stream = None
+                  self.pa = None
+                  self.available = False
+          
+              def stop(self) -> None:
+                  self.close_audio()
+                  super().stop()
+          
+          
+          # ---------------------------------------------------------------------------
+          # WebRTC host / local signaling IPC
+          # ---------------------------------------------------------------------------
+          class DesktopHost:
+              def __init__(self) -> None:
+                  self.pc: Optional[RTCPeerConnection] = None
+                  self.ws = None
+                  self.injector = InputInjector()
+                  self.pending_ice: list[dict[str, Any]] = []
+                  self.video: Optional[DesktopVideoTrack] = None
+                  self.audio: Optional[LoopbackAudioTrack] = None
+          
+              def rtc_config(self) -> RTCConfiguration:
+                  servers = [RTCIceServer(urls="stun:stun.cloudflare.com:3478")]
+                  turn_url = os.environ.get("UUC_TURN_URL", "").strip()
+                  if turn_url:
+                      servers.append(RTCIceServer(
+                          urls=turn_url,
+                          username=os.environ.get("UUC_TURN_USERNAME", ""),
+                          credential=os.environ.get("UUC_TURN_CREDENTIAL", ""),
+                      ))
+                  return RTCConfiguration(iceServers=servers)
+          
+              async def close_pc(self) -> None:
+                  pc, self.pc = self.pc, None
+                  if pc is not None:
+                      try: await pc.close()
+                      except Exception: pass
+                  if self.video is not None:
+                      try: self.video.stop()
+                      except Exception: pass
+                      self.video = None
+                  if self.audio is not None:
+                      try: self.audio.stop()
+                      except Exception: pass
+                      self.audio = None
+                  self.pending_ice.clear()
+          
+              async def send(self, obj: dict[str, Any]) -> None:
+                  if self.ws is not None:
+                      await self.ws.send(json.dumps(obj, separators=(",", ":")))
+          
+              async def new_pc(self) -> RTCPeerConnection:
+                  await self.close_pc()
+                  pc = RTCPeerConnection(self.rtc_config())
+                  self.pc = pc
+                  self.video = DesktopVideoTrack()
+                  self.audio = LoopbackAudioTrack()
+                  pc.addTrack(self.video)
+                  pc.addTrack(self.audio)
+          
+                  @pc.on("datachannel")
+                  def on_datachannel(channel):
+                      LOG.info("datachannel open request label=%s", channel.label)
+                      @channel.on("message")
+                      def on_message(message):
+                          if not isinstance(message, str):
+                              try: message = bytes(message).decode("utf-8", "replace")
+                              except Exception: return
+                          try:
+                              self.injector.handle(json.loads(message))
+                          except Exception as exc:
+                              LOG.debug("input decode failed: %s", exc)
+          
+                  @pc.on("connectionstatechange")
+                  async def state_change():
+                      LOG.info("WebRTC connectionState=%s ice=%s", pc.connectionState, pc.iceConnectionState)
+                      await self.send({
+                          "type": "desktop-state",
+                          "state": pc.connectionState,
+                          "audioAvailable": bool(self.audio and self.audio.available),
+                      })
+          
+                  return pc
+          
+              async def add_remote_ice(self, ice: dict[str, Any]) -> None:
+                  if self.pc is None:
+                      self.pending_ice.append(ice)
+                      return
+                  cand_text = str(ice.get("candidate", ""))
+                  if not cand_text:
+                      await self.pc.addIceCandidate(None)
+                      return
+                  if cand_text.startswith("candidate:"):
+                      cand_text = cand_text.split(":", 1)[1]
+                  candidate = candidate_from_sdp(cand_text)
+                  candidate.sdpMid = ice.get("sdpMid")
+                  candidate.sdpMLineIndex = int(ice.get("sdpMLineIndex", 0))
+                  await self.pc.addIceCandidate(candidate)
+          
+              async def handle(self, obj: dict[str, Any]) -> None:
+                  typ = obj.get("type")
+                  if typ == "rtc-offer":
+                      pc = await self.new_pc()
+                      offer = RTCSessionDescription(sdp=str(obj.get("sdp", "")), type="offer")
+                      await pc.setRemoteDescription(offer)
+                      pending, self.pending_ice = self.pending_ice, []
+                      for ice in pending:
+                          await self.add_remote_ice(ice)
+                      answer = await pc.createAnswer()
+                      # aiortc gathers ICE here; pc.localDescription contains candidates.
+                      await pc.setLocalDescription(answer)
+                      await self.send({"type": "rtc-answer", "desktopProtocol": 1, "sdp": pc.localDescription.sdp})
+                      LOG.info("RTC answer sent (%d SDP bytes)", len(pc.localDescription.sdp))
+                  elif typ == "rtc-ice":
+                      ice = obj.get("ice")
+                      if isinstance(ice, dict): await self.add_remote_ice(ice)
+                  elif typ == "rtc-restart":
+                      await self.close_pc()
+                  elif typ == "desktop-control":
+                      # Reserved for runtime bitrate/FPS profile commands.
+                      pass
+          
+              async def client(self, ws) -> None:
+                  self.ws = ws
+                  LOG.info("Local relay agent connected to desktop IPC")
+                  await self.send({"type": "desktop-state", "state": "host-ready", "desktopProtocol": 1})
+                  try:
+                      async for raw in ws:
+                          try:
+                              obj = json.loads(raw)
+                              await self.handle(obj)
+                          except Exception as exc:
+                              LOG.exception("desktop signal failed")
+                              await self.send({"type": "desktop-error", "message": f"{type(exc).__name__}: {exc}"})
+                  finally:
+                      self.ws = None
+                      await self.close_pc()
+                      LOG.info("Local relay agent disconnected from desktop IPC")
+          
+          
+          async def main() -> None:
+              host = DesktopHost()
+              async with websockets.serve(host.client, HOST, PORT, max_size=4 * 1024 * 1024, ping_interval=10, ping_timeout=20):
+                  LOG.info("UUC native desktop IPC ready ws://%s:%d target=%dx%d@%dfps touch=%s", HOST, PORT, TARGET_W, TARGET_H, TARGET_FPS, _TOUCH_OK)
+                  await asyncio.Future()
+          
+          
+          if __name__ == "__main__":
+              try:
+                  asyncio.run(main())
+              except KeyboardInterrupt:
+                  pass
+          '@ | Set-Content $hostPy -Encoding utf8
+
+          # Native desktop defaults: bandwidth-friendly 720p30. WebRTC itself handles
+          # congestion/retransmission; motion input is carried on an unreliable SCTP lane.
+          $env:UUC_DESKTOP_WIDTH = "1280"
+          $env:UUC_DESKTOP_HEIGHT = "720"
+          $env:UUC_DESKTOP_FPS = "30"
+          $env:UUC_DESKTOP_IPC_PORT = "8765"
+
+          $deskOut = Join-Path $env:RUNNER_TEMP "uuc-desktop.out.log"
+          $deskErr = Join-Path $env:RUNNER_TEMP "uuc-desktop.err.log"
+          $deskProc = Start-Process python -ArgumentList @($hostPy) `
+            -RedirectStandardOutput $deskOut -RedirectStandardError $deskErr -PassThru
+
+          $deadline = (Get-Date).AddSeconds(25)
+          $ready = $false
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+            if ($deskProc.HasExited) { break }
+            try {
+              $tcp = New-Object Net.Sockets.TcpClient
+              $ar = $tcp.BeginConnect("127.0.0.1",8765,$null,$null)
+              if ($ar.AsyncWaitHandle.WaitOne(750) -and $tcp.Connected) { $ready = $true }
+              $tcp.Close()
+            } catch {}
+            if ($ready) { break }
+          }
+          if (-not $ready) {
+            Get-Content $deskOut -ErrorAction SilentlyContinue
+            Get-Content $deskErr -ErrorAction SilentlyContinue
+            throw "Native WebRTC desktop host failed to start"
+          }
+
+          "DESKTOP_NATIVE_READY=1" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+          "DESKTOP_HOST_PID=$($deskProc.Id)" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+          Write-Host "Native WebRTC desktop host: READY (localhost IPC only)"
+
+      - name: Build Windows relay + USB-IP agent
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $r = Join-Path $env:RUNNER_TEMP "uuc-agent"
+          New-Item -ItemType Directory -Path $r -Force | Out-Null
+
+          @'
+          module universal-usb-cloud/agent
+          go 1.23
+          require github.com/gorilla/websocket v1.5.3
+          '@ | Set-Content "$r\go.mod" -Encoding utf8
+
+          @'
+          package main
+          
+          import (
+          	"bytes"
+          	"crypto/aes"
+          	"crypto/cipher"
+          	"crypto/ecdh"
+          	"crypto/hmac"
+          	"crypto/rand"
+          	"crypto/sha256"
+          	"encoding/base64"
+          	"encoding/binary"
+          	"encoding/json"
+          	"errors"
+          	"flag"
+          	"fmt"
+          	"io"
+          	"log"
+          	"net"
+          	"net/http"
+          	"net/url"
+          	"os"
+          	"os/signal"
+          	"strings"
+          	"sync"
+          	"sync/atomic"
+          	"syscall"
+          	"time"
+          
+          	"github.com/gorilla/websocket"
+          )
+          
+          const (
+          	ver         = 0x0111
+          	opReqImport = 0x8003
+          	opRepImport = 0x0003
+          	opReqList   = 0x8005
+          	opRepList   = 0x0005
+          	cmdSubmit   = 1
+          	cmdUnlink   = 2
+          	retSubmit   = 3
+          	retUnlink   = 4
+          	fReq        = 1
+          	fResp       = 2
+          	maxTransfer = 8 * 1024 * 1024
+          )
+          
+          var magic = []byte{'U', 'U', 'C', '2'}
+          
+          type Iface struct {
+          	ID               int `json:"id"`
+          	AlternateSetting int `json:"alternateSetting"`
+          	Class            int `json:"class"`
+          	Subclass         int `json:"subclass"`
+          	Protocol         int `json:"protocol"`
+          }
+          
+          type Device struct {
+          	Type              string  `json:"type"`
+          	Generation        uint64  `json:"generation"`
+          	StateKey          string  `json:"stateKey"`
+          	BusID             string  `json:"busid"`
+          	VendorID          int     `json:"vendorId"`
+          	ProductID         int     `json:"productId"`
+          	BCDDevice         int     `json:"bcdDevice"`
+          	DeviceClass       int     `json:"deviceClass"`
+          	DeviceSubclass    int     `json:"deviceSubclass"`
+          	DeviceProtocol    int     `json:"deviceProtocol"`
+          	ConfigValue       int     `json:"configValue"`
+          	NumConfigurations int     `json:"numConfigurations"`
+          	Interfaces        []Iface `json:"interfaces"`
+          	Product           string  `json:"product"`
+          }
+          
+          type response struct {
+          	status int32
+          	actual uint32
+          	data   []byte
+          }
+          
+          type Bridge struct {
+          	signal string
+          	room   string
+          
+          	wsMu    sync.RWMutex
+          	ws      *websocket.Conn
+          	writeMu sync.Mutex
+          
+          	// Native desktop signaling is proxied only over localhost to the
+          	// Python WebRTC media/input host. Media itself never traverses this socket.
+          	desktopMu      sync.RWMutex
+          	desktopWS      *websocket.Conn
+          	desktopWriteMu sync.Mutex
+          
+          	secureMu   sync.Mutex
+          	keyA2W     []byte
+          	keyW2A     []byte
+          	keyDesktop []byte
+          	serverPriv *ecdh.PrivateKey
+          	serverPub  []byte
+          	sendSeq    uint64
+          	recvSeq    uint64
+          
+          	devMu            sync.RWMutex
+          	dev              *Device
+          	devKey           string
+          	remoteGeneration uint64
+          	devGen           atomic.Uint64
+          	changes          chan uint64
+          
+          	pendMu  sync.Mutex
+          	pending map[uint64]chan response
+          	id      atomic.Uint64
+          
+          	stop chan struct{}
+          }
+          
+          func NewBridge(signal, room string) *Bridge {
+          	return &Bridge{
+          		signal:  signal,
+          		room:    room,
+          		pending: map[uint64]chan response{},
+          		changes: make(chan uint64, 16),
+          		stop:    make(chan struct{}),
+          	}
+          }
+          
+          func (b *Bridge) endpoint() (string, error) {
+          	u, e := url.Parse(b.signal)
+          	if e != nil {
+          		return "", e
+          	}
+          	q := u.Query()
+          	q.Set("room", b.room)
+          	q.Set("role", "windows")
+          	u.RawQuery = q.Encode()
+          	return u.String(), nil
+          }
+          
+          func (b *Bridge) Run() {
+          	go func() {
+          		for {
+          			select {
+          			case <-b.stop:
+          				return
+          			default:
+          			}
+          			if e := b.runOnce(); e != nil {
+          				log.Printf("relay: %v", e)
+          			}
+          			select {
+          			case <-b.stop:
+          				return
+          			case <-time.After(2 * time.Second):
+          			}
+          		}
+          	}()
+          }
+          
+          func (b *Bridge) desktopConnected() bool {
+          	b.desktopMu.RLock()
+          	defer b.desktopMu.RUnlock()
+          	return b.desktopWS != nil
+          }
+          
+          func (b *Bridge) desktopSendRaw(p []byte) error {
+          	b.desktopMu.RLock()
+          	ws := b.desktopWS
+          	b.desktopMu.RUnlock()
+          	if ws == nil {
+          		return errors.New("native desktop IPC offline")
+          	}
+          	b.desktopWriteMu.Lock()
+          	defer b.desktopWriteMu.Unlock()
+          	return ws.WriteMessage(websocket.TextMessage, p)
+          }
+          
+          func (b *Bridge) RunDesktopProxy() {
+          	go func() {
+          		for {
+          			select {
+          			case <-b.stop:
+          				return
+          			default:
+          			}
+          			ws, _, e := websocket.DefaultDialer.Dial("ws://127.0.0.1:8765", nil)
+          			if e != nil {
+          				log.Printf("desktop IPC connect: %v", e)
+          				time.Sleep(time.Second)
+          				continue
+          			}
+          			b.desktopMu.Lock()
+          			b.desktopWS = ws
+          			b.desktopMu.Unlock()
+          			log.Printf("NATIVE DESKTOP IPC CONNECTED")
+          			// Re-advertise desktop readiness if the relay is already online.
+          			_ = b.sendText(b.helloPayload())
+          			for {
+          				kind, p, e := ws.ReadMessage()
+          				if e != nil { break }
+          				if kind != websocket.TextMessage { continue }
+          				var g map[string]any
+          				if json.Unmarshal(p, &g) != nil { continue }
+          				typ, _ := g["type"].(string)
+          				if typ == "rtc-answer" || typ == "rtc-ice" || typ == "desktop-state" || typ == "desktop-error" {
+          					_ = b.write(websocket.TextMessage, p)
+          				}
+          			}
+          			b.desktopMu.Lock()
+          			if b.desktopWS == ws { b.desktopWS = nil }
+          			b.desktopMu.Unlock()
+          			_ = ws.Close()
+          			log.Printf("NATIVE DESKTOP IPC DISCONNECTED")
+          			// Do not leave Android with a stale green Desktop Ready state.
+          			offline, _ := json.Marshal(map[string]any{"type":"desktop-state", "state":"host-offline", "desktopProtocol":1})
+          			_ = b.write(websocket.TextMessage, offline)
+          			time.Sleep(time.Second)
+          		}
+          	}()
+          }
+          
+          var secureMagic = []byte{'U', 'U', 'E', '2'}
+          
+          func hkdfSHA256(ikm, salt, info []byte, outLen int) []byte {
+          	extract := hmac.New(sha256.New, salt)
+          	extract.Write(ikm)
+          	prk := extract.Sum(nil)
+          	out := make([]byte, 0, outLen)
+          	var prev []byte
+          	counter := byte(1)
+          	for len(out) < outLen {
+          		expand := hmac.New(sha256.New, prk)
+          		expand.Write(prev)
+          		expand.Write(info)
+          		expand.Write([]byte{counter})
+          		prev = expand.Sum(nil)
+          		need := outLen - len(out)
+          		if need > len(prev) {
+          			need = len(prev)
+          		}
+          		out = append(out, prev[:need]...)
+          		counter++
+          	}
+          	return out
+          }
+          
+          func secureNonce(prefix string, seq uint64) []byte {
+          	b := make([]byte, 12)
+          	copy(b[:4], []byte(prefix))
+          	binary.BigEndian.PutUint64(b[4:], seq)
+          	return b
+          }
+          
+          func (b *Bridge) setAndroidPublic(encoded string) error {
+          	raw, e := base64.RawURLEncoding.DecodeString(encoded)
+          	if e != nil {
+          		return e
+          	}
+          	curve := ecdh.P256()
+          	peer, e := curve.NewPublicKey(raw)
+          	if e != nil {
+          		return e
+          	}
+          	priv, e := curve.GenerateKey(rand.Reader)
+          	if e != nil {
+          		return e
+          	}
+          	shared, e := priv.ECDH(peer)
+          	if e != nil {
+          		return e
+          	}
+          	clean := strings.ToUpper(strings.ReplaceAll(b.room, "-", ""))
+          	saltArr := sha256.Sum256([]byte(clean))
+          	salt := saltArr[:]
+          	b.secureMu.Lock()
+          	defer b.secureMu.Unlock()
+          	b.serverPriv = priv
+          	b.serverPub = priv.PublicKey().Bytes()
+          	b.keyA2W = hkdfSHA256(shared, salt, []byte("uuc-v2-a2w"), 32)
+          	b.keyW2A = hkdfSHA256(shared, salt, []byte("uuc-v2-w2a"), 32)
+          	b.keyDesktop = hkdfSHA256(shared, salt, []byte("uuc-v2-desktop"), 32)
+          	b.sendSeq = 0
+          	b.recvSeq = 0
+          	log.Printf("E2E READY")
+          	return nil
+          }
+          
+          func (b *Bridge) secureReady() bool {
+          	b.secureMu.Lock()
+          	defer b.secureMu.Unlock()
+          	return len(b.keyA2W) == 32 && len(b.keyW2A) == 32 && len(b.keyDesktop) == 32 && len(b.serverPub) > 0
+          }
+          
+          func (b *Bridge) encryptToAndroid(plain []byte) ([]byte, error) {
+          	b.secureMu.Lock()
+          	defer b.secureMu.Unlock()
+          	if len(b.keyW2A) != 32 {
+          		return nil, errors.New("secure session not ready")
+          	}
+          	b.sendSeq++
+          	seq := b.sendSeq
+          	header := make([]byte, 12)
+          	copy(header[:4], secureMagic)
+          	binary.BigEndian.PutUint64(header[4:], seq)
+          	block, e := aes.NewCipher(b.keyW2A)
+          	if e != nil {
+          		return nil, e
+          	}
+          	gcm, e := cipherNewGCM(block)
+          	if e != nil {
+          		return nil, e
+          	}
+          	sealed := gcm.Seal(nil, secureNonce("W2A0", seq), plain, header)
+          	return append(header, sealed...), nil
+          }
+          
+          func (b *Bridge) decryptFromAndroid(packet []byte) ([]byte, error) {
+          	b.secureMu.Lock()
+          	defer b.secureMu.Unlock()
+          	if len(b.keyA2W) != 32 {
+          		return nil, errors.New("secure session not ready")
+          	}
+          	if len(packet) < 28 || !bytes.Equal(packet[:4], secureMagic) {
+          		return nil, errors.New("invalid secure packet")
+          	}
+          	seq := binary.BigEndian.Uint64(packet[4:12])
+          	if seq <= b.recvSeq {
+          		return nil, errors.New("replayed secure packet")
+          	}
+          	block, e := aes.NewCipher(b.keyA2W)
+          	if e != nil {
+          		return nil, e
+          	}
+          	gcm, e := cipherNewGCM(block)
+          	if e != nil {
+          		return nil, e
+          	}
+          	plain, e := gcm.Open(nil, secureNonce("A2W0", seq), packet[12:], packet[:12])
+          	if e != nil {
+          		return nil, e
+          	}
+          	b.recvSeq = seq
+          	return plain, nil
+          }
+          
+          // Small wrapper keeps crypto/cipher out of the generated source's public surface.
+          func cipherNewGCM(block cipher.Block) (cipher.AEAD, error) { return cipher.NewGCM(block) }
+          
+          func (b *Bridge) encryptedDesktopSecret() map[string]any {
+          	b.secureMu.Lock()
+          	defer b.secureMu.Unlock()
+          	if len(b.keyDesktop) != 32 || os.Getenv("DESKTOP_NATIVE_READY") != "1" {
+          		return nil
+          	}
+          	ice := []map[string]any{
+          		{"urls": []string{"stun:stun.cloudflare.com:3478"}},
+          	}
+          	if turnURL := strings.TrimSpace(os.Getenv("UUC_TURN_URL")); turnURL != "" {
+          		ice = append(ice, map[string]any{
+          			"urls": []string{turnURL},
+          			"username": os.Getenv("UUC_TURN_USERNAME"),
+          			"credential": os.Getenv("UUC_TURN_CREDENTIAL"),
+          		})
+          	}
+          	payload, _ := json.Marshal(map[string]any{
+          		"mode": "webrtc",
+          		"desktopReady": b.desktopConnected(),
+          		"desktopProtocol": 1,
+          		"iceServers": ice,
+          	})
+          	block, e := aes.NewCipher(b.keyDesktop)
+          	if e != nil { return nil }
+          	gcm, e := cipher.NewGCM(block)
+          	if e != nil { return nil }
+          	nonce := make([]byte, gcm.NonceSize())
+          	if _, e = rand.Read(nonce); e != nil { return nil }
+          	sealed := gcm.Seal(nil, nonce, payload, []byte("uuc-v2-desktop"))
+          	return map[string]any{
+          		"nonce":      base64.RawURLEncoding.EncodeToString(nonce),
+          		"ciphertext": base64.RawURLEncoding.EncodeToString(sealed),
+          	}
+          }
+          
+          func oidcAudience(room string, serverPublic []byte) string {
+          	clean := strings.ToUpper(strings.ReplaceAll(room, "-", ""))
+          	pub := base64.RawURLEncoding.EncodeToString(serverPublic)
+          	sum := sha256.Sum256([]byte(clean + "|" + pub))
+          	return fmt.Sprintf("uuc-%x", sum[:16])
+          }
+          
+          func (b *Bridge) oidcToken() string {
+          	base := os.Getenv("ACTIONS_ID_TOKEN_REQUEST_URL")
+          	bearer := os.Getenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+          	if base == "" || bearer == "" {
+          		return ""
+          	}
+          	sep := "&"
+          	if !strings.Contains(base, "?") {
+          		sep = "?"
+          	}
+          	b.secureMu.Lock()
+          	serverPublic := append([]byte(nil), b.serverPub...)
+          	b.secureMu.Unlock()
+          	if len(serverPublic) == 0 {
+          		return ""
+          	}
+          	endpoint := base + sep + "audience=" + url.QueryEscape(oidcAudience(b.room, serverPublic))
+          	req, e := http.NewRequest(http.MethodGet, endpoint, nil)
+          	if e != nil {
+          		return ""
+          	}
+          	req.Header.Set("Authorization", "bearer "+bearer)
+          	client := &http.Client{Timeout: 10 * time.Second}
+          	resp, e := client.Do(req)
+          	if e != nil {
+          		return ""
+          	}
+          	defer resp.Body.Close()
+          	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+          		return ""
+          	}
+          	var out struct {
+          		Value string `json:"value"`
+          	}
+          	if json.NewDecoder(resp.Body).Decode(&out) != nil {
+          		return ""
+          	}
+          	return out.Value
+          }
+          
+          func (b *Bridge) helloPayload() map[string]any {
+          	out := map[string]any{
+          		"type":       "hello",
+          		"role":       "windows",
+          		"protocol":   3,
+          		"oidcToken":  b.oidcToken(),
+          		"repository": os.Getenv("GITHUB_REPOSITORY"),
+          		"actor":      os.Getenv("GITHUB_ACTOR"),
+          		"runId":      os.Getenv("GITHUB_RUN_ID"),
+          	}
+          	b.secureMu.Lock()
+          	if len(b.serverPub) > 0 {
+          		out["serverPublic"] = base64.RawURLEncoding.EncodeToString(b.serverPub)
+          	}
+          	b.secureMu.Unlock()
+          	if secret := b.encryptedDesktopSecret(); secret != nil {
+          		out["desktopSecret"] = secret
+          	}
+          	return out
+          }
+          
+          func (b *Bridge) runOnce() error {
+          	ep, e := b.endpoint()
+          	if e != nil {
+          		return e
+          	}
+          	ws, _, e := websocket.DefaultDialer.Dial(ep, nil)
+          	if e != nil {
+          		return e
+          	}
+          
+          	b.wsMu.Lock()
+          	b.ws = ws
+          	b.wsMu.Unlock()
+          	defer func() {
+          		b.wsMu.Lock()
+          		if b.ws == ws {
+          			b.ws = nil
+          		}
+          		b.wsMu.Unlock()
+          		ws.Close()
+          	}()
+          
+          	log.Printf("RELAY CONNECTED")
+          	_ = b.sendText(b.helloPayload())
+          
+          	helloStop := make(chan struct{})
+          	defer close(helloStop)
+          
+          	go func() {
+          		ticker := time.NewTicker(15 * time.Second)
+          		defer ticker.Stop()
+          
+          		for {
+          			select {
+          			case <-helloStop:
+          				return
+          			case <-ticker.C:
+          				_ = b.sendText(map[string]any{
+          					"type":     "hello",
+          					"role":     "windows",
+          					"protocol": 2,
+          				})
+          
+          				_ = b.sendText(map[string]any{
+          					"type":   "request-usb-state",
+          					"reason": "periodic",
+          				})
+          			}
+          		}
+          	}()
+          
+          	for {
+          		kind, p, e := ws.ReadMessage()
+          		if e != nil {
+          			return e
+          		}
+          		if kind == websocket.TextMessage {
+          			b.handleText(p)
+          		}
+          		if kind == websocket.BinaryMessage {
+          			b.handleBinary(p)
+          		}
+          	}
+          }
+          
+          func (b *Bridge) write(kind int, p []byte) error {
+          	b.wsMu.RLock()
+          	ws := b.ws
+          	b.wsMu.RUnlock()
+          	if ws == nil {
+          		return errors.New("relay offline")
+          	}
+          	b.writeMu.Lock()
+          	defer b.writeMu.Unlock()
+          	return ws.WriteMessage(kind, p)
+          }
+          
+          func (b *Bridge) sendText(v any) error {
+          	p, e := json.Marshal(v)
+          	if e != nil {
+          		return e
+          	}
+          	return b.write(websocket.TextMessage, p)
+          }
+          
+          func deviceKey(d *Device) string {
+          	if d == nil {
+          		return ""
+          	}
+          	raw, _ := json.Marshal(d)
+          	return string(raw)
+          }
+          
+          func (b *Bridge) publishChange() {
+          	g := b.devGen.Add(1)
+          	select {
+          	case b.changes <- g:
+          	default:
+          	}
+          	log.Printf("USB GENERATION %d", g)
+          }
+          
+          func (b *Bridge) setDevice(d *Device) (accepted bool, changed bool) {
+          	key := deviceKey(d)
+          
+          	b.devMu.Lock()
+          	defer b.devMu.Unlock()
+          
+          	// Generation 0 is accepted for backward compatibility.
+          	// For the reliable v1.1.1 APK, stale generations are ignored.
+          	if d.Generation > 0 && b.remoteGeneration > 0 && d.Generation < b.remoteGeneration {
+          		return false, false
+          	}
+          
+          	sameKey := key != "" && key == b.devKey
+          	sameGeneration := d.Generation > 0 && d.Generation == b.remoteGeneration
+          
+          	if d.Generation > 0 {
+          		b.remoteGeneration = d.Generation
+          	}
+          
+          	b.dev = d
+          	b.devKey = key
+          
+          	// New generation must be treated as a physical lifetime transition
+          	// even when VID/PID/descriptors are identical.
+          	changed = !sameKey || !sameGeneration
+          
+          	return true, changed
+          }
+          
+          func (b *Bridge) clearDevice(incomingGeneration uint64) (accepted bool, changed bool) {
+          	b.devMu.Lock()
+          	defer b.devMu.Unlock()
+          
+          	if incomingGeneration > 0 &&
+          		b.remoteGeneration > 0 &&
+          		incomingGeneration < b.remoteGeneration {
+          		return false, false
+          	}
+          
+          	had := b.dev != nil || b.devKey != ""
+          
+          	if incomingGeneration > 0 {
+          		b.remoteGeneration = incomingGeneration
+          	}
+          
+          	b.dev = nil
+          	b.devKey = ""
+          
+          	return true, had
+          }
+          
+          func (b *Bridge) Generation() uint64     { return b.devGen.Load() }
+          func (b *Bridge) Changes() <-chan uint64 { return b.changes }
+          
+          func (b *Bridge) handleText(p []byte) {
+          	var g map[string]any
+          	if json.Unmarshal(p, &g) != nil {
+          		log.Printf("ANDROID TEXT JSON decode failed: %q", string(p))
+          		return
+          	}
+          
+          	typ, _ := g["type"].(string)
+          
+          	if typ != "hello" && typ != "peer-joined" && typ != "peer-left" {
+          		log.Printf("ANDROID TEXT type=%q bytes=%d", typ, len(p))
+          	}
+          
+          	if typ == "app-ping" {
+          		_ = b.sendText(map[string]any{"type": "app-pong", "time": g["time"]})
+          		return
+          	}
+          
+          	if typ == "rtc-offer" || typ == "rtc-ice" || typ == "rtc-restart" || typ == "desktop-control" {
+          		if !b.secureReady() {
+          			_ = b.sendText(map[string]any{"type":"desktop-error", "message":"secure desktop session not ready"})
+          			return
+          		}
+          		if e := b.desktopSendRaw(p); e != nil {
+          			_ = b.sendText(map[string]any{"type":"desktop-error", "message":e.Error()})
+          		}
+          		return
+          	}
+          
+          	if typ == "usb-device" {
+          		var d Device
+          		if json.Unmarshal(p, &d) != nil {
+          			log.Printf("ANDROID usb-device JSON decode failed: %s", string(p))
+          			return
+          		}
+          
+          		if d.BusID == "" {
+          			d.BusID = "1-1"
+          		}
+          
+          		old := b.Device()
+          		accepted, changed := b.setDevice(&d)
+          
+          		if !accepted {
+          			log.Printf(
+          				"ANDROID USB STALE ignored androidGen=%d currentRemoteGen=%d",
+          				d.Generation, b.remoteGeneration,
+          			)
+          			_ = b.sendText(map[string]any{
+          				"type":       "usb-ack",
+          				"generation": d.Generation,
+          				"state":      "stale",
+          			})
+          			return
+          		}
+          
+          		if changed {
+          			b.publishChange()
+          		}
+          
+          		if old == nil {
+          			log.Printf(
+          				"ANDROID USB READY bridgeGen=%d androidGen=%d %04x:%04x %q",
+          				b.Generation(), d.Generation, d.VendorID, d.ProductID, d.Product,
+          			)
+          		} else if old.VendorID != d.VendorID ||
+          			old.ProductID != d.ProductID ||
+          			old.BCDDevice != d.BCDDevice ||
+          			old.Product != d.Product ||
+          			old.Generation != d.Generation {
+          			log.Printf(
+          				"ANDROID USB REENUM bridgeGen=%d androidGen=%d %04x:%04x -> %04x:%04x %q",
+          				b.Generation(), d.Generation,
+          				old.VendorID, old.ProductID,
+          				d.VendorID, d.ProductID, d.Product,
+          			)
+          		} else {
+          			log.Printf(
+          				"ANDROID USB REFRESH bridgeGen=%d androidGen=%d %04x:%04x %q",
+          				b.Generation(), d.Generation, d.VendorID, d.ProductID, d.Product,
+          			)
+          		}
+          
+          		_ = b.sendText(map[string]any{
+          			"type":       "usb-ack",
+          			"generation": d.Generation,
+          			"state":      "present",
+          		})
+          		return
+          	}
+          
+          	if typ == "usb-detach" {
+          		incomingGen := uint64(0)
+          		if v, ok := g["generation"].(float64); ok && v >= 0 {
+          			incomingGen = uint64(v)
+          		}
+          
+          		accepted, changed := b.clearDevice(incomingGen)
+          
+          		if !accepted {
+          			log.Printf(
+          				"ANDROID USB DETACH stale ignored androidGen=%d",
+          				incomingGen,
+          			)
+          			return
+          		}
+          
+          		if changed {
+          			b.publishChange()
+          		}
+          
+          		log.Printf(
+          			"ANDROID USB DETACHED bridgeGen=%d androidGen=%d",
+          			b.Generation(), incomingGen,
+          		)
+          
+          		_ = b.sendText(map[string]any{
+          			"type":       "usb-ack",
+          			"generation": incomingGen,
+          			"state":      "absent",
+          		})
+          		return
+          	}
+          
+          	if typ == "hello" {
+          		if role, _ := g["role"].(string); role == "android" {
+          			log.Printf("ANDROID ONLINE")
+          			if pub, _ := g["ecdhPublic"].(string); pub != "" {
+          				if e := b.setAndroidPublic(pub); e != nil {
+          					log.Printf("E2E handshake failed: %v", e)
+          				}
+          			}
+          
+          			_ = b.sendText(b.helloPayload())
+          
+          			_ = b.sendText(map[string]any{
+          				"type":   "request-usb-state",
+          				"reason": "android-hello",
+          			})
+          		}
+          		return
+          	}
+          
+          	if typ == "peer-joined" {
+          		if role, _ := g["role"].(string); role == "android" {
+          			log.Printf("ANDROID PEER JOINED")
+          
+          			_ = b.sendText(b.helloPayload())
+          
+          			_ = b.sendText(map[string]any{
+          				"type":   "request-usb-state",
+          				"reason": "peer-joined",
+          			})
+          		}
+          		return
+          	}
+          
+          	log.Printf("relay text: %s", strings.TrimSpace(string(p)))
+          }
+          
+          func (b *Bridge) handleBinary(p []byte) {
+          	plain, e := b.decryptFromAndroid(p)
+          	if e != nil {
+          		log.Printf("E2E response decrypt: %v", e)
+          		return
+          	}
+          	p = plain
+          	if len(p) < 21 || !bytes.Equal(p[:4], magic) || p[4] != fResp {
+          		return
+          	}
+          	r := bytes.NewReader(p[5:])
+          	var id uint64
+          	var st int32
+          	var actual uint32
+          	if binary.Read(r, binary.BigEndian, &id) != nil {
+          		return
+          	}
+          	if binary.Read(r, binary.BigEndian, &st) != nil {
+          		return
+          	}
+          	if binary.Read(r, binary.BigEndian, &actual) != nil {
+          		return
+          	}
+          	data, _ := io.ReadAll(r)
+          	if uint32(len(data)) > actual {
+          		data = data[:actual]
+          	}
+          	b.pendMu.Lock()
+          	ch := b.pending[id]
+          	delete(b.pending, id)
+          	b.pendMu.Unlock()
+          	if ch != nil {
+          		ch <- response{st, actual, data}
+          	}
+          }
+          
+          func (b *Bridge) Device() *Device {
+          	b.devMu.RLock()
+          	defer b.devMu.RUnlock()
+          	if b.dev == nil {
+          		return nil
+          	}
+          	d := *b.dev
+          	d.Interfaces = append([]Iface(nil), b.dev.Interfaces...)
+          	return &d
+          }
+          
+          func (b *Bridge) Transfer(dir, ep uint8, setup [8]byte, payload []byte, n int) response {
+          	if n < 0 || n > maxTransfer {
+          		return response{status: -90}
+          	}
+          	id := b.id.Add(1)
+          	ch := make(chan response, 1)
+          	b.pendMu.Lock()
+          	b.pending[id] = ch
+          	b.pendMu.Unlock()
+          
+          	buf := new(bytes.Buffer)
+          	buf.Write(magic)
+          	buf.WriteByte(fReq)
+          	binary.Write(buf, binary.BigEndian, id)
+          	buf.WriteByte(dir)
+          	buf.WriteByte(ep)
+          	binary.Write(buf, binary.BigEndian, uint32(30000))
+          	binary.Write(buf, binary.BigEndian, uint32(n))
+          	buf.Write(setup[:])
+          	if dir == 0 && n > 0 {
+          		if len(payload) < n {
+          			n = len(payload)
+          		}
+          		buf.Write(payload[:n])
+          	}
+          
+          	encrypted, e := b.encryptToAndroid(buf.Bytes())
+          	if e != nil {
+          		b.pendMu.Lock()
+          		delete(b.pending, id)
+          		b.pendMu.Unlock()
+          		return response{status: -107}
+          	}
+          	if e := b.write(websocket.BinaryMessage, encrypted); e != nil {
+          		b.pendMu.Lock()
+          		delete(b.pending, id)
+          		b.pendMu.Unlock()
+          		return response{status: -107}
+          	}
+          
+          	select {
+          	case r := <-ch:
+          		return r
+          	case <-time.After(35 * time.Second):
+          		b.pendMu.Lock()
+          		delete(b.pending, id)
+          		b.pendMu.Unlock()
+          		return response{status: -110}
+          	}
+          }
+          
+          func fixed(s string, n int) []byte { o := make([]byte, n); copy(o, []byte(s)); return o }
+          
+          func writeDev(w io.Writer, d *Device, ifs bool) error {
+          	w.Write(fixed("/virtual/android-usb/1-1", 256))
+          	bus := d.BusID
+          	if bus == "" {
+          		bus = "1-1"
+          	}
+          	w.Write(fixed(bus, 32))
+          	for _, v := range []any{uint32(1), uint32(1), uint32(3), uint16(d.VendorID), uint16(d.ProductID), uint16(d.BCDDevice)} {
+          		if e := binary.Write(w, binary.BigEndian, v); e != nil {
+          			return e
+          		}
+          	}
+          	w.Write([]byte{byte(d.DeviceClass), byte(d.DeviceSubclass), byte(d.DeviceProtocol),
+          		byte(d.ConfigValue), byte(d.NumConfigurations), byte(len(d.Interfaces))})
+          	if ifs {
+          		for _, i := range d.Interfaces {
+          			w.Write([]byte{byte(i.Class), byte(i.Subclass), byte(i.Protocol), 0})
+          		}
+          	}
+          	return nil
+          }
+          
+          func full(c net.Conn, n int) ([]byte, error) {
+          	p := make([]byte, n)
+          	_, e := io.ReadFull(c, p)
+          	return p, e
+          }
+          
+          type Server struct {
+          	b         *Bridge
+          	importsMu sync.Mutex
+          	imports   map[net.Conn]struct{}
+          }
+          
+          func NewServer(b *Bridge) *Server {
+          	return &Server{b: b, imports: map[net.Conn]struct{}{}}
+          }
+          
+          func (s *Server) addImport(c net.Conn) {
+          	s.importsMu.Lock()
+          	s.imports[c] = struct{}{}
+          	n := len(s.imports)
+          	s.importsMu.Unlock()
+          	log.Printf("USB/IP active imports=%d", n)
+          }
+          
+          func (s *Server) delImport(c net.Conn) {
+          	s.importsMu.Lock()
+          	delete(s.imports, c)
+          	n := len(s.imports)
+          	s.importsMu.Unlock()
+          	log.Printf("USB/IP active imports=%d", n)
+          }
+          
+          func (s *Server) closeImports(reason string) {
+          	s.importsMu.Lock()
+          	conns := make([]net.Conn, 0, len(s.imports))
+          	for c := range s.imports {
+          		conns = append(conns, c)
+          	}
+          	s.importsMu.Unlock()
+          
+          	if len(conns) > 0 {
+          		log.Printf("USB/IP closing %d import(s): %s", len(conns), reason)
+          	}
+          	for _, c := range conns {
+          		_ = c.Close()
+          	}
+          }
+          
+          func (s *Server) WatchDeviceChanges() {
+          	go func() {
+          		for g := range s.b.Changes() {
+          			s.closeImports(fmt.Sprintf("Android USB generation changed to %d", g))
+          		}
+          	}()
+          }
+          
+          func (s *Server) Serve(addr string) error {
+          	ln, e := net.Listen("tcp", addr)
+          	if e != nil {
+          		return e
+          	}
+          	log.Printf("USB/IP server %s", addr)
+          	for {
+          		c, e := ln.Accept()
+          		if e != nil {
+          			return e
+          		}
+          		go s.conn(c)
+          	}
+          }
+          
+          func (s *Server) conn(c net.Conn) {
+          	defer c.Close()
+          	c.SetDeadline(time.Now().Add(30 * time.Second))
+          	h, e := full(c, 8)
+          	if e != nil {
+          		return
+          	}
+          	op := binary.BigEndian.Uint16(h[2:4])
+          
+          	if op == opReqList {
+          		s.list(c)
+          		return
+          	}
+          
+          	if op == opReqImport {
+          		p, e := full(c, 32)
+          		if e != nil {
+          			return
+          		}
+          		bus := strings.TrimRight(string(p), "\x00")
+          		s.importDev(c, bus)
+          		return
+          	}
+          }
+          
+          func (s *Server) list(c net.Conn) {
+          	d := s.b.Device()
+          	buf := new(bytes.Buffer)
+          	binary.Write(buf, binary.BigEndian, uint16(ver))
+          	binary.Write(buf, binary.BigEndian, uint16(opRepList))
+          	binary.Write(buf, binary.BigEndian, uint32(0))
+          	if d == nil {
+          		binary.Write(buf, binary.BigEndian, uint32(0))
+          		c.Write(buf.Bytes())
+          		return
+          	}
+          	binary.Write(buf, binary.BigEndian, uint32(1))
+          	writeDev(buf, d, true)
+          	c.Write(buf.Bytes())
+          }
+          
+          func (s *Server) importDev(c net.Conn, bus string) {
+          	d := s.b.Device()
+          	buf := new(bytes.Buffer)
+          	binary.Write(buf, binary.BigEndian, uint16(ver))
+          	binary.Write(buf, binary.BigEndian, uint16(opRepImport))
+          	if d == nil || bus != d.BusID {
+          		binary.Write(buf, binary.BigEndian, uint32(1))
+          		c.Write(buf.Bytes())
+          		return
+          	}
+          	binary.Write(buf, binary.BigEndian, uint32(0))
+          	writeDev(buf, d, false)
+          	if _, e := c.Write(buf.Bytes()); e != nil {
+          		return
+          	}
+          	c.SetDeadline(time.Time{})
+          	s.addImport(c)
+          	defer s.delImport(c)
+          	log.Printf("USB/IP IMPORT %s gen=%d", bus, s.b.Generation())
+          	s.urbs(c)
+          }
+          
+          func (s *Server) urbs(c net.Conn) {
+          	var wm sync.Mutex
+          	var cm sync.Mutex
+          	cancelled := map[uint32]bool{}
+          
+          	for {
+          		h, e := full(c, 48)
+          		if e != nil {
+          			log.Printf("USB/IP URB stream ended: %v", e)
+          			return
+          		}
+          
+          		cmd := binary.BigEndian.Uint32(h[0:4])
+          		seq := binary.BigEndian.Uint32(h[4:8])
+          		devid := binary.BigEndian.Uint32(h[8:12])
+          		dir := binary.BigEndian.Uint32(h[12:16])
+          		ep := binary.BigEndian.Uint32(h[16:20])
+          
+          		if cmd == cmdSubmit {
+          			flags := binary.BigEndian.Uint32(h[20:24])
+          			n := int(int32(binary.BigEndian.Uint32(h[24:28])))
+          			startFrame := int32(binary.BigEndian.Uint32(h[28:32]))
+          			packets := int32(binary.BigEndian.Uint32(h[32:36]))
+          			interval := int32(binary.BigEndian.Uint32(h[36:40]))
+          			var setup [8]byte
+          			copy(setup[:], h[40:48])
+          
+          			if ep == 0 {
+          				log.Printf(
+          					"URB SUBMIT seq=%d devid=%08x dir=%d ep=%d len=%d flags=%08x start=%d packets=%d interval=%d setup=% x",
+          					seq, devid, dir, ep, n, flags, startFrame, packets, interval, setup,
+          				)
+          			} else {
+          				log.Printf(
+          					"URB SUBMIT seq=%d dir=%d ep=%d len=%d flags=%08x",
+          					seq, dir, ep, n, flags,
+          				)
+          			}
+          
+          			if n < 0 || n > maxTransfer {
+          				log.Printf("URB REJECT seq=%d invalid length=%d", seq, n)
+          				go retSub(c, &wm, seq, -90, 0, nil)
+          				continue
+          			}
+          
+          			var payload []byte
+          			if dir == 0 && n > 0 {
+          				payload, e = full(c, n)
+          				if e != nil {
+          					return
+          				}
+          			}
+          
+          			if packets > 0 {
+          				if _, e = full(c, int(packets)*16); e != nil {
+          					return
+          				}
+          				go retSub(c, &wm, seq, -95, 0, nil)
+          				continue
+          			}
+          
+          			go func(seq, dir, ep uint32, setup [8]byte, payload []byte, n int) {
+          				r := s.b.Transfer(uint8(dir), uint8(ep), setup, payload, n)
+          
+          				if ep == 0 {
+          					preview := r.data
+          					if len(preview) > 32 {
+          						preview = preview[:32]
+          					}
+          					log.Printf(
+          						"URB COMPLETE seq=%d ep=0 status=%d actual=%d data[0:%d]=% x",
+          						seq, r.status, r.actual, len(preview), preview,
+          					)
+          				} else {
+          					log.Printf(
+          						"URB COMPLETE seq=%d ep=%d status=%d actual=%d",
+          						seq, ep, r.status, r.actual,
+          					)
+          				}
+          
+          				cm.Lock()
+          				x := cancelled[seq]
+          				delete(cancelled, seq)
+          				cm.Unlock()
+          				if x {
+          					return
+          				}
+          				data := r.data
+          				if dir == 0 {
+          					data = nil
+          				}
+          				retSub(c, &wm, seq, r.status, r.actual, data)
+          			}(seq, dir, ep, setup, payload, n)
+          			continue
+          		}
+          
+          		if cmd == cmdUnlink {
+          			target := binary.BigEndian.Uint32(h[20:24])
+          			cm.Lock()
+          			cancelled[target] = true
+          			cm.Unlock()
+          			retUnlinkFn(c, &wm, seq, -104)
+          			continue
+          		}
+          
+          		log.Printf("USB/IP unknown command: 0x%08x seq=%d", cmd, seq)
+          		return
+          	}
+          }
+          
+          func retSub(c net.Conn, m *sync.Mutex, seq uint32, st int32, actual uint32, data []byte) {
+          	b := new(bytes.Buffer)
+          	for _, v := range []any{uint32(retSubmit), seq, uint32(0), uint32(0), uint32(0), st, actual,
+          		uint32(0), uint32(0xffffffff), uint32(0), uint64(0)} {
+          		binary.Write(b, binary.BigEndian, v)
+          	}
+          	if data != nil {
+          		b.Write(data)
+          	}
+          	m.Lock()
+          	defer m.Unlock()
+          	c.Write(b.Bytes())
+          }
+          
+          func retUnlinkFn(c net.Conn, m *sync.Mutex, seq uint32, st int32) {
+          	b := new(bytes.Buffer)
+          	for _, v := range []any{uint32(retUnlink), seq, uint32(0), uint32(0), uint32(0), st} {
+          		binary.Write(b, binary.BigEndian, v)
+          	}
+          	b.Write(make([]byte, 24))
+          	m.Lock()
+          	defer m.Unlock()
+          	c.Write(b.Bytes())
+          }
+          
+          func main() {
+          	signalURL := flag.String("signal", "", "relay URL")
+          	room := flag.String("room", "", "room")
+          	flag.Parse()
+          	if *signalURL == "" || len(*room) < 12 {
+          		flag.Usage()
+          		os.Exit(2)
+          	}
+          
+          	b := NewBridge(*signalURL, *room)
+          	b.RunDesktopProxy()
+          	b.Run()
+          	s := NewServer(b)
+          	s.WatchDeviceChanges()
+          	go func() {
+          		if e := s.Serve("127.0.0.1:3240"); e != nil {
+          			log.Fatal(e)
+          		}
+          	}()
+          
+          	log.Printf("FULL RELAY AGENT READY")
+          	stop := make(chan os.Signal, 1)
+          	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+          	<-stop
+          	close(b.stop)
+          }
+          '@ | Set-Content "$r\main.go" -Encoding utf8
+
+          Push-Location $r
+          go mod tidy
+          go build -trimpath -ldflags="-s -w" -o uuc-agent.exe .
+          Pop-Location
+
+          $exe = Join-Path $r "uuc-agent.exe"
+          if (-not (Test-Path $exe)) { throw "Agent build gagal" }
+          "AGENT_EXE=$exe" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+          Write-Host "Windows FULL agent: OK"
+
+      - name: Run FULL USB bridge
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:ROOM) -or $env:ROOM.Length -lt 12) {
+            throw "pair_code minimal 12 karakter"
+          }
+
+          $out = Join-Path $env:RUNNER_TEMP "uuc.out.log"
+          $err = Join-Path $env:RUNNER_TEMP "uuc.err.log"
+
+          $roomNormalized = ($env:ROOM -replace '-', '').ToUpperInvariant()
+          $agentArgs = @("-signal",$env:SIGNAL_URL,"-room",$roomNormalized)
+
+          $proc = Start-Process `
+            -FilePath $env:AGENT_EXE `
+            -ArgumentList $agentArgs `
+            -RedirectStandardOutput $out `
+            -RedirectStandardError $err `
+            -PassThru
+
+          Start-Sleep 3
+          if ($proc.HasExited) {
+            Get-Content $out -ErrorAction SilentlyContinue
+            Get-Content $err -ErrorAction SilentlyContinue
+            throw "Agent langsung mati"
+          }
+
+          Write-Host "========================================"
+          Write-Host " FULL CLOUD USB READY"
+          Write-Host " Pair Code sama dengan APK"
+          Write-Host " APK otomatis connect ke relay"
+          Write-Host " APK -> approve runner -> connect USB"
+          Write-Host "========================================"
+
+          $attached = $false
+          $attachedKey = $null
+          $attachedPort = $null
+          $lastSeenKey = $null
+          $transition = 0
+
+          # Explicit hotplug verifier: PASS only after PRESENT -> ABSENT -> PRESENT.
+          $presenceState = "UNKNOWN"
+          $seenPresent = $false
+          $seenAbsentAfterPresent = $false
+          $hotplugPass = $false
+          $stateHistory = New-Object System.Collections.Generic.List[string]
+
+          function Record-PresenceState([string]$NewState,[string]$Reason) {
+            if ($NewState -eq $script:presenceState) { return }
+            $oldState = $script:presenceState
+            $script:presenceState = $NewState
+            $stamp = Get-Date -Format "HH:mm:ss.fff"
+            $entry = "$stamp $oldState -> $NewState ($Reason)"
+            $script:stateHistory.Add($entry)
+            Write-Host ""
+            Write-Host "################################################"
+            Write-Host " REMOTE STATE CHANGE: $oldState -> $NewState"
+            Write-Host " Reason: $Reason"
+            Write-Host "################################################"
+            if ($NewState -eq "PRESENT") {
+              if (-not $script:seenPresent) {
+                $script:seenPresent = $true
+              } elseif ($script:seenAbsentAfterPresent -and -not $script:hotplugPass) {
+                $script:hotplugPass = $true
+                Write-Host ""
+                Write-Host "================================================"
+                Write-Host " HOTPLUG PASS: PRESENT -> ABSENT -> PRESENT"
+                Write-Host "================================================"
+              }
+            } elseif ($NewState -eq "ABSENT" -and $script:seenPresent) {
+              $script:seenAbsentAfterPresent = $true
+            }
+          }
+
+          function Get-RemoteUsbState {
+            $listText = (& "$env:USBIP_EXE" list -r 127.0.0.1 2>&1 | Out-String)
+            $m = [regex]::Match(
+              $listText,
+              '(?im)^\s*([0-9]+-[0-9]+(?:\.[0-9]+)*)\s*:.*?\(([0-9a-f]{4}):([0-9a-f]{4})\)'
+            )
+
+            if (-not $m.Success) {
+              return [pscustomobject]@{
+                Present = $false
+                BusId = $null
+                Vid = $null
+                Pid = $null
+                Key = $null
+                Raw = $listText
+              }
+            }
+
+            $bus = $m.Groups[1].Value
+            $vid = $m.Groups[2].Value.ToLowerInvariant()
+            $usbPid = $m.Groups[3].Value.ToLowerInvariant()
+
+            return [pscustomobject]@{
+              Present = $true
+              BusId = $bus
+              Vid = $vid
+              Pid = $usbPid
+              Key = "$bus|$vid`:$usbPid"
+              Raw = $listText
+            }
+          }
+
+          function Get-UsbIpPortState {
+            $portText = (& "$env:USBIP_EXE" port 2>&1 | Out-String)
+            $m = [regex]::Match($portText,'(?im)^Port\s+([0-9]+):\s+device in use')
+
+            return [pscustomobject]@{
+              Active = $m.Success
+              Port = if ($m.Success) { [int]$m.Groups[1].Value } else { $null }
+              Raw = $portText
+            }
+          }
+
+          function Detach-UsbIpPort([string]$Reason) {
+            $portState = Get-UsbIpPortState
+
+            Write-Host ""
+            Write-Host "========================================"
+            Write-Host " USB/IP DETACH"
+            Write-Host " Reason: $Reason"
+            Write-Host "========================================"
+
+            if ($portState.Active) {
+              & "$env:USBIP_EXE" detach -p $portState.Port
+              Write-Host "detach exit code: $LASTEXITCODE"
+            }
+            else {
+              & "$env:USBIP_EXE" detach --all
+              Write-Host "detach --all exit code: $LASTEXITCODE"
+            }
+
+            Start-Sleep 2
+            pnputil.exe /scan-devices | Out-Host
+
+            $script:attached = $false
+            $script:attachedKey = $null
+            $script:attachedPort = $null
+          }
+
+          function Show-UsbPnP([string]$Title) {
+            Write-Host ""
+            Write-Host "--- $Title ---"
+
+            Get-PnpDevice -ErrorAction SilentlyContinue |
+              Where-Object {
+                $_.Class -match 'USB|WPD|DiskDrive|Ports|AndroidUsbDeviceClass' -or
+                $_.InstanceId -match 'USBIP|VID_'
+              } |
+              Select-Object Status,Class,FriendlyName,InstanceId,Problem |
+              Sort-Object Class,FriendlyName |
+              Format-Table -AutoSize
+
+            Write-Host "`n--- Problem devices ---"
+            pnputil.exe /enum-devices /problem /deviceids /drivers /services /stack
+          }
+
+          function Prepare-MtpDriverIfNeeded([string]$UsbVid,[string]$UsbPid) {
+            if ($UsbVid -ne '2d95' -or $UsbPid -ne '6002') { return }
+
+            $wpdSvc = Get-Service WPDBusEnum -ErrorAction SilentlyContinue
+            if ($wpdSvc) {
+              try {
+                Set-Service WPDBusEnum -StartupType Manual -ErrorAction SilentlyContinue
+                Start-Service WPDBusEnum -ErrorAction SilentlyContinue
+              } catch {}
+            }
+
+            $mtpCandidates = @()
+            $inboxMtp = Join-Path $env:WINDIR 'INF\wpdmtp.inf'
+            if (Test-Path $inboxMtp) { $mtpCandidates += $inboxMtp }
+
+            $repoMtps = Get-ChildItem `
+              "$env:WINDIR\System32\DriverStore\FileRepository" `
+              -Filter wpdmtp.inf `
+              -Recurse `
+              -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty FullName
+
+            if ($repoMtps) { $mtpCandidates += $repoMtps }
+
+            foreach ($mtpInf in @($mtpCandidates | Select-Object -Unique)) {
+              & pnputil.exe /add-driver "$mtpInf" /install | Out-Host
+            }
+          }
+
+          function Attach-RemoteUsb($remote) {
+            Write-Host ""
+            Write-Host "========================================"
+            Write-Host " USB/IP ATTACH"
+            Write-Host " Remote: $($remote.Key)"
+            Write-Host "========================================"
+
+            Prepare-MtpDriverIfNeeded $remote.Vid $remote.Pid
+
+            $attachText = (
+              & "$env:USBIP_EXE" attach -r 127.0.0.1 -b $remote.BusId 2>&1 |
+              Out-String
+            )
+            $attachExit = $LASTEXITCODE
+
+            Write-Host $attachText
+            Write-Host "usbip attach exit code: $attachExit"
+
+            if ($attachExit -ne 0 -and
+                $attachText -notmatch '(?i)successfully attached|attached successfully') {
+              Write-Warning "Attach gagal; akan dicoba lagi."
+              return $false
+            }
+
+            Start-Sleep 3
+            pnputil.exe /scan-devices | Out-Host
+            Start-Sleep 3
+
+            $portState = Get-UsbIpPortState
+            $script:attached = $true
+            $script:attachedKey = $remote.Key
+            $script:attachedPort = $portState.Port
+
+            Write-Host ""
+            Write-Host "========================================"
+            Write-Host " USB ATTACHED TO WINDOWS"
+            Write-Host " Key : $($remote.Key)"
+            Write-Host " Port: $($script:attachedPort)"
+            Write-Host "========================================"
+
+            Show-UsbPnP "PnP after attach $($remote.Key)"
+            return $true
+          }
+
+          $end = (Get-Date).AddMinutes([int]$env:KEEP)
+
+          while ((Get-Date) -lt $end) {
+            if ($proc.HasExited) {
+              Get-Content $out -Tail 300 -ErrorAction SilentlyContinue
+              Get-Content $err -Tail 300 -ErrorAction SilentlyContinue
+              throw "Agent berhenti"
+            }
+
+            $remote = Get-RemoteUsbState
+            $portState = Get-UsbIpPortState
+
+            if ($attached -and -not $portState.Active) {
+              Write-Host "USB/IP port vanished -> treating as DETACH"
+              Record-PresenceState "ABSENT" "USB/IP imported port vanished"
+              $attached = $false
+              $attachedKey = $null
+              $attachedPort = $null
+            }
+
+            if (-not $remote.Present) {
+              Record-PresenceState "ABSENT" "usbip DEVLIST reports no Android USB"
+              if ($attached -or $portState.Active) {
+                $transition++
+                Detach-UsbIpPort "Android physical USB disappeared (transition #$transition)"
+              }
+
+              if ($lastSeenKey -ne $null) {
+                Write-Host "HOTPLUG: device disappeared: $lastSeenKey"
+                $lastSeenKey = $null
+                Show-UsbPnP "PnP after physical detach"
+              }
+
+              Write-Host "WAITING FOR ANDROID USB..."
+            }
+            else {
+              Record-PresenceState "PRESENT" "usbip DEVLIST reports $($remote.Key)"
+              if ($lastSeenKey -ne $remote.Key) {
+                $transition++
+
+                Write-Host ""
+                Write-Host "========================================"
+                Write-Host " HOTPLUG / RE-ENUMERATION #$transition"
+                Write-Host " Previous: $lastSeenKey"
+                Write-Host " Current : $($remote.Key)"
+                Write-Host "========================================"
+
+                if ($attached -or $portState.Active) {
+                  Detach-UsbIpPort "USB identity changed: $attachedKey -> $($remote.Key)"
+                }
+
+                $lastSeenKey = $remote.Key
+              }
+
+              if ($attached -and $attachedKey -ne $remote.Key) {
+                Detach-UsbIpPort "Attached identity no longer matches exported identity"
+              }
+
+              if (-not $attached) {
+                [void](Attach-RemoteUsb $remote)
+              }
+            }
+
+            Write-Host ""
+            Write-Host "=== $(Get-Date -Format o) ==="
+            Write-Host "Remote present : $($remote.Present)"
+            Write-Host "Remote key     : $($remote.Key)"
+            Write-Host "Attached       : $attached"
+            Write-Host "Attached key   : $attachedKey"
+            Write-Host "Attached port  : $attachedPort"
+            Write-Host "Transitions    : $transition"
+            Write-Host "Presence state : $presenceState"
+            Write-Host "Hotplug PASS   : $hotplugPass"
+            Write-Host "State history  :"
+            if ($stateHistory.Count -eq 0) {
+              Write-Host "  (none yet)"
+            } else {
+              $stateHistory | Select-Object -Last 8 | ForEach-Object { Write-Host "  $_" }
+            }
+
+            Get-Content $out -Tail 80 -ErrorAction SilentlyContinue
+            Get-Content $err -Tail 60 -ErrorAction SilentlyContinue
+
+            Start-Sleep 1
+          }
+
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
