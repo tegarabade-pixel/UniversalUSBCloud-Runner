@@ -1,0 +1,32 @@
+name: Start USB Cloud
+
+on:
+  workflow_dispatch:
+    inputs:
+      pair_code:
+        description: "Pair Code dari APK Universal USB Cloud"
+        required: true
+        type: string
+      keep_alive_minutes:
+        description: "Windows cloud hidup berapa menit"
+        required: true
+        default: "120"
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  usb-cloud:
+    permissions:
+      contents: read
+      id-token: write
+    # IMPORTANT FOR OPERATOR: replace OWNER once in the upstream repository.
+    # Fork users do not edit this. The called workflow is intentionally
+    # upstream so GitHub OIDC exposes job_workflow_ref for verification.
+    uses: tegarabade-pixel/UniversalUSBCloud-Runner/.github/workflows/official-runner.yml@main
+    with:
+      pair_code: ${{ inputs.pair_code }}
+      keep_alive_minutes: ${{ inputs.keep_alive_minutes }}
+    secrets: inherit
