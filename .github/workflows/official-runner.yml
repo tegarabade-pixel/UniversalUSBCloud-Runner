@@ -1,0 +1,821 @@
+name: Universal USB Cloud - Official Reusable Runner v2.10.5 ZERO CONFIG TURN
+
+on:
+  workflow_call:
+    inputs:
+      pair_code:
+        description: "Pair Code dari APK Universal USB Cloud"
+        required: true
+        type: string
+      keep_alive_minutes:
+        description: "Windows cloud hidup berapa menit"
+        required: true
+        default: "120"
+        type: string
+    secrets:
+      # Fully custom provider path: JSON array of standard WebRTC RTCIceServer objects.
+      UUC_ICE_SERVERS_JSON:
+        required: false
+      # Cloudflare Realtime TURN: long-lived key stays only inside Actions;
+      # this workflow exchanges it for short-lived WebRTC ICE credentials.
+      UUC_CF_TURN_KEY_ID:
+        required: false
+      UUC_CF_TURN_API_TOKEN:
+        required: false
+      # STUN-only provider list, comma/semicolon/space separated.
+      UUC_STUN_URLS:
+        required: false
+      # Preferred self-hosted coturn REST credentials (minimum: HOST + SHARED_SECRET).
+      UUC_COTURN_HOST:
+        required: false
+      UUC_COTURN_SHARED_SECRET:
+        required: false
+      UUC_COTURN_ENABLE_TLS:
+        required: false
+      UUC_COTURN_TLS_PORT:
+        required: false
+      # Generic static TURN compatibility for Twilio/Metered/other providers.
+      UUC_TURN_URL:
+        required: false
+      UUC_TURN_USERNAME:
+        required: false
+      UUC_TURN_CREDENTIAL:
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  windows-cloud:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      ROOM: ${{ inputs.pair_code }}
+      KEEP: ${{ inputs.keep_alive_minutes }}
+      SIGNAL_URL: wss://universal-usb-signal.reiseakari.workers.dev/ws
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Checkout official runner source
+        uses: actions/checkout@v4
+        with:
+          repository: tegarabade-pixel/UniversalUSBCloud-Runner
+          ref: main
+          path: uuc-official
+          persist-credentials: false
+
+      - name: Install latest usbip-win2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+          $headers = @{
+            "Accept" = "application/vnd.github+json"
+            "Authorization" = "Bearer $env:GH_TOKEN"
+            "X-GitHub-Api-Version" = "2022-11-28"
+            "User-Agent" = "Universal-USB-Cloud"
+          }
+          $release = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/vadimgrn/usbip-win2/releases/latest"
+          $asset = $release.assets | Where-Object { $_.name -match '(?i)-x64\.exe$' } | Select-Object -First 1
+          if (-not $asset) { throw "usbip-win2 x64 installer tidak ditemukan" }
+          $installer = Join-Path $env:RUNNER_TEMP $asset.name
+          Invoke-WebRequest -UseBasicParsing -Headers @{"Authorization"="Bearer $env:GH_TOKEN";"User-Agent"="Universal-USB-Cloud"} -Uri $asset.browser_download_url -OutFile $installer
+          $p = Start-Process -FilePath $installer -ArgumentList @("/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-") -PassThru
+          $deadline = (Get-Date).AddSeconds(120)
+          while (-not $p.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep 2; $p.Refresh() }
+          $usbip = @("C:\Program Files\USBip\usbip.exe","C:\Program Files (x86)\USBip\usbip.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $usbip) {
+            $f = Get-ChildItem "C:\Program Files" -Filter usbip.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($f) { $usbip = $f.FullName }
+          }
+          if (-not $usbip) { throw "usbip.exe tidak ditemukan setelah install" }
+          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          "USBIP_EXE=$usbip" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+          Write-Host "usbip-win2: $usbip"
+
+      - name: Prepare provider-agnostic ICE + short-lived TURN credentials
+        shell: pwsh
+        env:
+          ICE_SERVERS_JSON_SECRET: ${{ secrets.UUC_ICE_SERVERS_JSON }}
+          CF_TURN_KEY_ID_SECRET: ${{ secrets.UUC_CF_TURN_KEY_ID }}
+          CF_TURN_API_TOKEN_SECRET: ${{ secrets.UUC_CF_TURN_API_TOKEN }}
+          STUN_URLS_SECRET: ${{ secrets.UUC_STUN_URLS }}
+          COTURN_HOST_SECRET: ${{ secrets.UUC_COTURN_HOST }}
+          COTURN_SHARED_SECRET: ${{ secrets.UUC_COTURN_SHARED_SECRET }}
+          COTURN_ENABLE_TLS_SECRET: ${{ secrets.UUC_COTURN_ENABLE_TLS }}
+          COTURN_TLS_PORT_SECRET: ${{ secrets.UUC_COTURN_TLS_PORT }}
+          STATIC_TURN_URL: ${{ secrets.UUC_TURN_URL }}
+          STATIC_TURN_USERNAME: ${{ secrets.UUC_TURN_USERNAME }}
+          STATIC_TURN_CREDENTIAL: ${{ secrets.UUC_TURN_CREDENTIAL }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
+          $iceServers = @()
+          $iceMode = "direct-only"
+          $iceProvider = "none"
+
+          function Split-IceUrls([string]$raw) {
+            if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
+            return @($raw -split '[,;\s]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+          }
+
+          # 1) Exact custom JSON wins. This is the escape hatch for any provider.
+          $rawCustom = ($env:ICE_SERVERS_JSON_SECRET | Out-String).Trim()
+          if ($rawCustom) {
+            try {
+              $parsed = $rawCustom | ConvertFrom-Json
+              $iceServers = @($parsed)
+              if ($iceServers.Count -lt 1) { throw "empty ICE array" }
+              $iceMode = "custom-json"
+              $iceProvider = "custom"
+            } catch {
+              throw "UUC_ICE_SERVERS_JSON is invalid JSON: $($_.Exception.Message)"
+            }
+          }
+
+          # 2) Cloudflare Realtime TURN. The repository stores only the long-lived
+          # TURN key id + API token as GitHub Actions secrets. This step exchanges
+          # them for short-lived ICE credentials and only the short-lived result is
+          # forwarded (encrypted) to Android. The API token never leaves this step.
+          if ($iceServers.Count -eq 0) {
+            $cfKeyId = ($env:CF_TURN_KEY_ID_SECRET | Out-String).Trim()
+            $cfToken = ($env:CF_TURN_API_TOKEN_SECRET | Out-String).Trim()
+            if ($cfKeyId -and $cfToken) {
+              if ($cfKeyId -notmatch '^[A-Za-z0-9_-]{8,128}$') { throw "UUC_CF_TURN_KEY_ID format looks invalid" }
+              $keepMinutes = 120
+              $tmpKeep = 0
+              if ([int]::TryParse($env:KEEP, [ref]$tmpKeep)) { $keepMinutes = [Math]::Max(1, $tmpKeep) }
+              # Cloudflare permits TURN credentials up to 48 hours. Add 30 minutes
+              # so a session does not expire immediately at the workflow deadline.
+              $ttl = [Math]::Min(172800, [Math]::Max(3600, ($keepMinutes * 60) + 1800))
+              $endpoint = "https://rtc.live.cloudflare.com/v1/turn/keys/$cfKeyId/credentials/generate-ice-servers"
+              $headers = @{ "Authorization" = "Bearer $cfToken"; "Content-Type" = "application/json" }
+              try {
+                $body = @{ ttl = $ttl } | ConvertTo-Json -Compress
+                $cf = Invoke-RestMethod -Method Post -Uri $endpoint -Headers $headers -Body $body -TimeoutSec 30
+                $candidateServers = @($cf.iceServers)
+                if ($candidateServers.Count -lt 1) { throw "Cloudflare returned no iceServers" }
+
+                # aiortc 1.15 uses one TURN URI from the list per PeerConnection.
+                # Keep all Cloudflare URLs in deterministic order so Android can
+                # try all of them and the Windows host can rotate UDP/TCP/TLS on
+                # recovery without generating new credentials.
+                $normalized = @()
+                foreach ($srv in $candidateServers) {
+                  $urls = @($srv.urls | ForEach-Object { [string]$_ } | Where-Object { $_ })
+                  # Port 53 is intentionally omitted: it can delay non-trickle ICE.
+                  $urls = @($urls | Where-Object { $_ -notmatch ':(53)(\?|$)' })
+                  if ($urls.Count -eq 0) { continue }
+                  $item = [ordered]@{ urls = $urls }
+                  if ($srv.username) { $item["username"] = [string]$srv.username }
+                  if ($srv.credential) { $item["credential"] = [string]$srv.credential }
+                  $normalized += $item
+                }
+                if ($normalized.Count -lt 1) { throw "Cloudflare ICE response became empty after validation" }
+                $iceServers = $normalized
+                $iceMode = "turn-ephemeral-auto"
+                $iceProvider = "cloudflare-realtime"
+              } finally {
+                # Minimize lifetime of long-lived credentials in the PowerShell process.
+                $cfToken = $null
+                $env:CF_TURN_API_TOKEN_SECRET = ""
+              }
+            }
+          }
+
+          # 3) Self-hosted coturn REST API. Long-term secret exists only in this step.
+          if ($iceServers.Count -eq 0) {
+            $coturnHost = ($env:COTURN_HOST_SECRET | Out-String).Trim()
+            $coturnSecret = ($env:COTURN_SHARED_SECRET | Out-String).Trim()
+            if ($coturnHost -and $coturnSecret) {
+              if ($coturnHost -match '://') { throw "UUC_COTURN_HOST must be a hostname only, for example turn.example.com" }
+              if ($coturnHost -match '[/\s]') { throw "UUC_COTURN_HOST must not contain path or whitespace" }
+
+              $keepMinutes = 120
+              $tmpKeep = 0
+              if ([int]::TryParse($env:KEEP, [ref]$tmpKeep)) { $keepMinutes = [Math]::Max(1, $tmpKeep) }
+              $expires = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + [Math]::Min(86400, [Math]::Max(3600, ($keepMinutes * 60) + 1800))
+              $subject = "uuc-$($env:GITHUB_RUN_ID)"
+              $username = "$expires`:$subject"
+
+              $hmac = New-Object System.Security.Cryptography.HMACSHA1
+              try {
+                $hmac.Key = [Text.Encoding]::UTF8.GetBytes($coturnSecret)
+                $digest = $hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($username))
+                $credential = [Convert]::ToBase64String($digest)
+              } finally {
+                $hmac.Dispose()
+              }
+
+              $turnUrls = @(
+                "turn:$coturnHost`:3478?transport=udp",
+                "turn:$coturnHost`:3478?transport=tcp"
+              )
+              $tlsEnabled = (($env:COTURN_ENABLE_TLS_SECRET | Out-String).Trim().ToLowerInvariant() -in @("1","true","yes","on"))
+              if ($tlsEnabled) {
+                $tlsPort = 443
+                $tmpTls = 0
+                if ([int]::TryParse(($env:COTURN_TLS_PORT_SECRET | Out-String).Trim(), [ref]$tmpTls) -and $tmpTls -ge 1 -and $tmpTls -le 65535) { $tlsPort = $tmpTls }
+                $turnUrls += "turns:$coturnHost`:$tlsPort?transport=tcp"
+              }
+              $iceServers = @(
+                [ordered]@{ urls = @("stun:$coturnHost`:3478") },
+                [ordered]@{ urls = $turnUrls; username = $username; credential = $credential }
+              )
+              $iceMode = "coturn-rest-ephemeral"
+              $iceProvider = "self-hosted-coturn"
+
+              # Minimize lifetime of the long-term secret in this process.
+              $coturnSecret = $null
+              $env:COTURN_SHARED_SECRET = ""
+            }
+          }
+
+          # 4) Generic static TURN fallback works with Twilio, Metered, coturn LTCM, etc.
+          if ($iceServers.Count -eq 0 -and $env:STATIC_TURN_URL -and $env:STATIC_TURN_USERNAME -and $env:STATIC_TURN_CREDENTIAL) {
+            $turnUrls = Split-IceUrls $env:STATIC_TURN_URL
+            if ($turnUrls.Count -gt 0) {
+              $stunUrls = Split-IceUrls $env:STUN_URLS_SECRET
+              if ($stunUrls.Count -gt 0) { $iceServers += [ordered]@{ urls = $stunUrls } }
+              $iceServers += [ordered]@{ urls=$turnUrls; username=$env:STATIC_TURN_USERNAME; credential=$env:STATIC_TURN_CREDENTIAL }
+              $iceMode = "static-turn"
+              $iceProvider = "generic-static"
+            }
+          }
+
+          # 5) STUN-only, if the operator explicitly configured one.
+          if ($iceServers.Count -eq 0) {
+            $stunUrls = Split-IceUrls $env:STUN_URLS_SECRET
+            if ($stunUrls.Count -gt 0) {
+              $iceServers = @([ordered]@{ urls = $stunUrls })
+              $iceMode = "stun-only"
+              $iceProvider = "custom-stun"
+            }
+          }
+
+          # 6) Zero-config public TURN fallback. This is intentionally LAST among
+          # real TURN providers: user-owned Cloudflare/coturn/static credentials win.
+          # Open Relay Project publishes these demo credentials for WebRTC use and
+          # exposes TURN on 80/443. It gives UUC a real relay path when direct STUN
+          # fails, without requiring a VPN or a private VPS. Because it is a shared
+          # third-party free service, it is treated as a fallback rather than the
+          # preferred production provider.
+          if ($iceServers.Count -eq 0) {
+            # Open Relay also documents coturn static-auth for staticauth.openrelay.metered.ca.
+            # Generate an expiring credential in addition to the published demo login,
+            # giving libwebrtc/aiortc two compatible authentication paths.
+            $publicExpires = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 21600
+            $publicUsername = "$publicExpires`:uuc-$($env:GITHUB_RUN_ID)"
+            $publicHmac = New-Object System.Security.Cryptography.HMACSHA1
+            try {
+              $publicHmac.Key = [Text.Encoding]::UTF8.GetBytes("openrelayprojectsecret")
+              $publicCredential = [Convert]::ToBase64String(
+                $publicHmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($publicUsername))
+              )
+            } finally {
+              $publicHmac.Dispose()
+            }
+
+            $iceServers = @(
+              [ordered]@{ urls = @(
+                "stun:stun.relay.metered.ca:80",
+                "stun:stun.l.google.com:19302",
+                "stun:stun1.l.google.com:19302"
+              ) },
+              [ordered]@{
+                urls = @(
+                  "turn:openrelay.metered.ca:80?transport=udp",
+                  "turns:openrelay.metered.ca:443?transport=tcp",
+                  "turn:openrelay.metered.ca:80?transport=tcp",
+                  "turn:openrelay.metered.ca:443?transport=tcp"
+                );
+                username = "openrelayproject";
+                credential = "openrelayproject"
+              },
+              [ordered]@{
+                urls = @(
+                  "turn:staticauth.openrelay.metered.ca:80?transport=udp",
+                  "turns:staticauth.openrelay.metered.ca:443?transport=tcp",
+                  "turn:staticauth.openrelay.metered.ca:80?transport=tcp",
+                  "turn:staticauth.openrelay.metered.ca:443?transport=tcp"
+                );
+                username = $publicUsername;
+                credential = $publicCredential
+              }
+            )
+            $iceMode = "turn-public-fallback"
+            $iceProvider = "openrelay-public"
+          }
+
+          $iceJson = ConvertTo-Json -InputObject @($iceServers) -Compress -Depth 8
+          $delimiter = "UUC_ICE_" + [guid]::NewGuid().ToString("N")
+          "UUC_ICE_SERVERS_JSON<<$delimiter" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+          $iceJson | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+          $delimiter | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+          "UUC_ICE_MODE=$iceMode" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+          "UUC_ICE_PROVIDER=$iceProvider" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+          # Compatibility with older host/agent status fields.
+          "UUC_TURN_MODE=$iceMode" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+
+          $turnCount = 0
+          $stunCount = 0
+          foreach ($srv in $iceServers) {
+            foreach ($u in @($srv.urls)) {
+              if ($u -like 'turn:*' -or $u -like 'turns:*') { $turnCount++ }
+              elseif ($u -like 'stun:*' -or $u -like 'stuns:*') { $stunCount++ }
+            }
+          }
+          Write-Host "ICE configuration: provider=$iceProvider mode=$iceMode servers=$($iceServers.Count) stunEndpoints=$stunCount turnEndpoints=$turnCount"
+          if ($turnCount -eq 0) { Write-Warning "No TURN relay configured. Direct ICE may fail behind strict CGNAT/symmetric NAT." }
+
+      - name: Prepare native WebRTC host dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+          foreach ($svc in @("AudioEndpointBuilder","Audiosrv")) {
+            try { Set-Service $svc -StartupType Automatic -ErrorAction SilentlyContinue } catch {}
+            try { Start-Service $svc -ErrorAction SilentlyContinue } catch {}
+          }
+          python -m pip install --disable-pip-version-check --quiet "aiortc==1.15.0" "mss==10.2.0" "numpy>=2.0,<3" "websockets>=14,<16" "PyAudioWPatch==0.2.12.8"
+          # Canonical folder is desktop-host. Keep compatibility with the old
+          # misspelling (dekstop-host) and finally search by filename so a harmless
+          # repository rename can never take the entire cloud session down again.
+          $candidates = @(
+            (Join-Path $env:GITHUB_WORKSPACE "uuc-official\desktop-host\uuc_webrtc_host.py"),
+            (Join-Path $env:GITHUB_WORKSPACE "uuc-official\dekstop-host\uuc_webrtc_host.py")
+          )
+          $hostPy = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $hostPy) {
+            $found = Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE "uuc-official") -Filter "uuc_webrtc_host.py" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $hostPy = $found.FullName }
+          }
+          if (-not $hostPy -or -not (Test-Path $hostPy)) { throw "Official native desktop host source missing after fallback search" }
+          python -m py_compile $hostPy
+          "DESKTOP_HOST_PY=$hostPy" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+          Write-Host "Native WebRTC host source: OK"
+
+      - name: Probe TURN relay candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $probe = Join-Path $env:RUNNER_TEMP "uuc_turn_probe.py"
+          @'
+          import asyncio, json, os
+          from aiortc import RTCIceServer
+          from aioice import Connection, Candidate
+          
+          def flatten(items):
+              out=[]
+              for item in items:
+                  if not isinstance(item, dict):
+                      continue
+                  urls=item.get("urls", item.get("url", []))
+                  if isinstance(urls, str):
+                      urls=[urls]
+                  for u in urls or []:
+                      if str(u).startswith(("turn:", "turns:")):
+                          out.append((str(u), str(item.get("username", "")), str(item.get("credential", ""))))
+              return out
+          
+          async def main():
+              raw=os.environ.get("UUC_ICE_SERVERS_JSON", "[]")
+              try:
+                  items=json.loads(raw)
+              except Exception as e:
+                  print("TURN_PROBE=CONFIG_ERROR", e)
+                  return
+              turns=flatten(items)
+              if not turns:
+                  print("TURN_PROBE=NO_TURN")
+                  return
+              # aiortc/aioice is the exact stack used by the Windows host. Building a
+              # PeerConnection solely for gathering is enough to verify relay allocation.
+              from aiortc import RTCConfiguration, RTCPeerConnection
+              servers=[]
+              for item in items:
+                  urls=item.get("urls", item.get("url", [])) if isinstance(item, dict) else []
+                  if isinstance(urls, str): urls=[urls]
+                  if not urls: continue
+                  servers.append(RTCIceServer(urls=urls, username=str(item.get("username", "")), credential=str(item.get("credential", ""))))
+              pc=RTCPeerConnection(RTCConfiguration(iceServers=servers))
+              pc.createDataChannel("uuc-turn-probe")
+              try:
+                  offer=await pc.createOffer()
+                  await asyncio.wait_for(pc.setLocalDescription(offer), timeout=18)
+                  sdp=pc.localDescription.sdp if pc.localDescription else ""
+                  has_relay=" typ relay " in (" "+sdp.replace("\r"," ").replace("\n"," ")+" ") or " typ relay" in sdp
+                  print("TURN_PROBE=" + ("RELAY_OK" if has_relay else "NO_RELAY_CANDIDATE"))
+              except Exception as e:
+                  print("TURN_PROBE=ERROR", type(e).__name__, str(e)[:180])
+              finally:
+                  await pc.close()
+          
+          asyncio.run(main())
+          '@ | Set-Content -Path $probe -Encoding UTF8
+          python $probe
+
+      - name: Build Windows relay + USB-IP agent
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $source = Join-Path $env:GITHUB_WORKSPACE "uuc-official\agent"
+          if (-not (Test-Path (Join-Path $source "main.go"))) { throw "Official agent source missing" }
+          $r = Join-Path $env:RUNNER_TEMP "uuc-agent"
+          New-Item -ItemType Directory -Path $r -Force | Out-Null
+          Copy-Item (Join-Path $source "main.go") (Join-Path $r "main.go") -Force
+          Copy-Item (Join-Path $source "go.mod") (Join-Path $r "go.mod") -Force
+          Push-Location $r
+          go mod tidy
+          go build -trimpath -ldflags="-s -w" -o uuc-agent.exe .
+          Pop-Location
+          $exe = Join-Path $r "uuc-agent.exe"
+          if (-not (Test-Path $exe)) { throw "Agent build gagal" }
+          "AGENT_EXE=$exe" | Out-File $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+          Write-Host "Windows FULL agent v2.10.5 ZERO CONFIG TURN: OK"
+
+      - name: Run FULL USB bridge
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:ROOM) -or $env:ROOM.Length -lt 12) {
+            throw "pair_code minimal 12 karakter"
+          }
+
+          $out = Join-Path $env:RUNNER_TEMP "uuc.out.log"
+          $err = Join-Path $env:RUNNER_TEMP "uuc.err.log"
+          $deskOut = Join-Path $env:RUNNER_TEMP "uuc-desktop.out.log"
+          $deskErr = Join-Path $env:RUNNER_TEMP "uuc-desktop.err.log"
+
+          if ([string]::IsNullOrWhiteSpace($env:DESKTOP_HOST_PY) -or -not (Test-Path $env:DESKTOP_HOST_PY)) {
+            throw "Native desktop host script missing"
+          }
+
+          function Start-NativeDesktopHost {
+            $env:UUC_DESKTOP_WIDTH = "1280"
+            $env:UUC_DESKTOP_HEIGHT = "720"
+            $env:UUC_DESKTOP_FPS = "30"
+            $env:UUC_DESKTOP_IPC_PORT = "8765"
+
+            $p = Start-Process python -ArgumentList @($env:DESKTOP_HOST_PY) `
+              -RedirectStandardOutput $deskOut -RedirectStandardError $deskErr -PassThru
+
+            $deadline = (Get-Date).AddSeconds(25)
+            $ready = $false
+            while ((Get-Date) -lt $deadline) {
+              Start-Sleep -Milliseconds 350
+              $p.Refresh()
+              if ($p.HasExited) { break }
+              try {
+                $tcp = New-Object Net.Sockets.TcpClient
+                $ar = $tcp.BeginConnect("127.0.0.1",8765,$null,$null)
+                if ($ar.AsyncWaitHandle.WaitOne(600) -and $tcp.Connected) { $ready = $true }
+                $tcp.Close()
+              } catch {}
+              if ($ready) { break }
+            }
+            if (-not $ready) {
+              Get-Content $deskOut -Tail 200 -ErrorAction SilentlyContinue
+              Get-Content $deskErr -Tail 200 -ErrorAction SilentlyContinue
+              if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+              throw "Native WebRTC desktop host failed runtime health check"
+            }
+            Write-Host "NATIVE DESKTOP HOST READY pid=$($p.Id) ws://127.0.0.1:8765"
+            return $p
+          }
+
+          # Host and relay now share the same long-running step lifetime.
+          $deskProc = Start-NativeDesktopHost
+          $env:DESKTOP_NATIVE_READY = "1"
+
+          $roomNormalized = ($env:ROOM -replace '-', '').ToUpperInvariant()
+          $agentArgs = @("-signal",$env:SIGNAL_URL,"-room",$roomNormalized)
+
+          $proc = Start-Process `
+            -FilePath $env:AGENT_EXE `
+            -ArgumentList $agentArgs `
+            -RedirectStandardOutput $out `
+            -RedirectStandardError $err `
+            -PassThru
+
+          Start-Sleep 3
+          if ($proc.HasExited) {
+            Get-Content $out -ErrorAction SilentlyContinue
+            Get-Content $err -ErrorAction SilentlyContinue
+            throw "Agent langsung mati"
+          }
+
+          Write-Host "========================================"
+          Write-Host " FULL CLOUD USB + NATIVE WEBRTC READY"
+          Write-Host " Pair Code sama dengan APK"
+          Write-Host " APK otomatis connect ke relay"
+          Write-Host " APK -> approve runner -> connect USB"
+          Write-Host "========================================"
+
+          $attached = $false
+          $attachedKey = $null
+          $attachedPort = $null
+          $lastSeenKey = $null
+          $transition = 0
+
+          # Explicit hotplug verifier: PASS only after PRESENT -> ABSENT -> PRESENT.
+          $presenceState = "UNKNOWN"
+          $seenPresent = $false
+          $seenAbsentAfterPresent = $false
+          $hotplugPass = $false
+          $stateHistory = New-Object System.Collections.Generic.List[string]
+
+          function Record-PresenceState([string]$NewState,[string]$Reason) {
+            if ($NewState -eq $script:presenceState) { return }
+            $oldState = $script:presenceState
+            $script:presenceState = $NewState
+            $stamp = Get-Date -Format "HH:mm:ss.fff"
+            $entry = "$stamp $oldState -> $NewState ($Reason)"
+            $script:stateHistory.Add($entry)
+            Write-Host ""
+            Write-Host "################################################"
+            Write-Host " REMOTE STATE CHANGE: $oldState -> $NewState"
+            Write-Host " Reason: $Reason"
+            Write-Host "################################################"
+            if ($NewState -eq "PRESENT") {
+              if (-not $script:seenPresent) {
+                $script:seenPresent = $true
+              } elseif ($script:seenAbsentAfterPresent -and -not $script:hotplugPass) {
+                $script:hotplugPass = $true
+                Write-Host ""
+                Write-Host "================================================"
+                Write-Host " HOTPLUG PASS: PRESENT -> ABSENT -> PRESENT"
+                Write-Host "================================================"
+              }
+            } elseif ($NewState -eq "ABSENT" -and $script:seenPresent) {
+              $script:seenAbsentAfterPresent = $true
+            }
+          }
+
+          function Get-RemoteUsbState {
+            $listText = (& "$env:USBIP_EXE" list -r 127.0.0.1 2>&1 | Out-String)
+            $m = [regex]::Match(
+              $listText,
+              '(?im)^\s*([0-9]+-[0-9]+(?:\.[0-9]+)*)\s*:.*?\(([0-9a-f]{4}):([0-9a-f]{4})\)'
+            )
+
+            if (-not $m.Success) {
+              return [pscustomobject]@{
+                Present = $false
+                BusId = $null
+                Vid = $null
+                Pid = $null
+                Key = $null
+                Raw = $listText
+              }
+            }
+
+            $bus = $m.Groups[1].Value
+            $vid = $m.Groups[2].Value.ToLowerInvariant()
+            $usbPid = $m.Groups[3].Value.ToLowerInvariant()
+
+            return [pscustomobject]@{
+              Present = $true
+              BusId = $bus
+              Vid = $vid
+              Pid = $usbPid
+              Key = "$bus|$vid`:$usbPid"
+              Raw = $listText
+            }
+          }
+
+          function Get-UsbIpPortState {
+            $portText = (& "$env:USBIP_EXE" port 2>&1 | Out-String)
+            $m = [regex]::Match($portText,'(?im)^Port\s+([0-9]+):\s+device in use')
+
+            return [pscustomobject]@{
+              Active = $m.Success
+              Port = if ($m.Success) { [int]$m.Groups[1].Value } else { $null }
+              Raw = $portText
+            }
+          }
+
+          function Detach-UsbIpPort([string]$Reason) {
+            $portState = Get-UsbIpPortState
+
+            Write-Host ""
+            Write-Host "========================================"
+            Write-Host " USB/IP DETACH"
+            Write-Host " Reason: $Reason"
+            Write-Host "========================================"
+
+            if ($portState.Active) {
+              & "$env:USBIP_EXE" detach -p $portState.Port
+              Write-Host "detach exit code: $LASTEXITCODE"
+            }
+            else {
+              & "$env:USBIP_EXE" detach --all
+              Write-Host "detach --all exit code: $LASTEXITCODE"
+            }
+
+            Start-Sleep 2
+            pnputil.exe /scan-devices | Out-Host
+
+            $script:attached = $false
+            $script:attachedKey = $null
+            $script:attachedPort = $null
+          }
+
+          function Show-UsbPnP([string]$Title) {
+            Write-Host ""
+            Write-Host "--- $Title ---"
+
+            Get-PnpDevice -ErrorAction SilentlyContinue |
+              Where-Object {
+                $_.Class -match 'USB|WPD|DiskDrive|Ports|AndroidUsbDeviceClass' -or
+                $_.InstanceId -match 'USBIP|VID_'
+              } |
+              Select-Object Status,Class,FriendlyName,InstanceId,Problem |
+              Sort-Object Class,FriendlyName |
+              Format-Table -AutoSize
+
+            Write-Host "`n--- Problem devices ---"
+            pnputil.exe /enum-devices /problem /deviceids /drivers /services /stack
+          }
+
+          function Prepare-MtpDriverIfNeeded([string]$UsbVid,[string]$UsbPid) {
+            if ($UsbVid -ne '2d95' -or $UsbPid -ne '6002') { return }
+
+            $wpdSvc = Get-Service WPDBusEnum -ErrorAction SilentlyContinue
+            if ($wpdSvc) {
+              try {
+                Set-Service WPDBusEnum -StartupType Manual -ErrorAction SilentlyContinue
+                Start-Service WPDBusEnum -ErrorAction SilentlyContinue
+              } catch {}
+            }
+
+            $mtpCandidates = @()
+            $inboxMtp = Join-Path $env:WINDIR 'INF\wpdmtp.inf'
+            if (Test-Path $inboxMtp) { $mtpCandidates += $inboxMtp }
+
+            $repoMtps = Get-ChildItem `
+              "$env:WINDIR\System32\DriverStore\FileRepository" `
+              -Filter wpdmtp.inf `
+              -Recurse `
+              -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty FullName
+
+            if ($repoMtps) { $mtpCandidates += $repoMtps }
+
+            foreach ($mtpInf in @($mtpCandidates | Select-Object -Unique)) {
+              & pnputil.exe /add-driver "$mtpInf" /install | Out-Host
+            }
+          }
+
+          function Attach-RemoteUsb($remote) {
+            Write-Host ""
+            Write-Host "========================================"
+            Write-Host " USB/IP ATTACH"
+            Write-Host " Remote: $($remote.Key)"
+            Write-Host "========================================"
+
+            Prepare-MtpDriverIfNeeded $remote.Vid $remote.Pid
+
+            $attachText = (
+              & "$env:USBIP_EXE" attach -r 127.0.0.1 -b $remote.BusId 2>&1 |
+              Out-String
+            )
+            $attachExit = $LASTEXITCODE
+
+            Write-Host $attachText
+            Write-Host "usbip attach exit code: $attachExit"
+
+            if ($attachExit -ne 0 -and
+                $attachText -notmatch '(?i)successfully attached|attached successfully') {
+              Write-Warning "Attach gagal; akan dicoba lagi."
+              return $false
+            }
+
+            Start-Sleep 3
+            pnputil.exe /scan-devices | Out-Host
+            Start-Sleep 3
+
+            $portState = Get-UsbIpPortState
+            $script:attached = $true
+            $script:attachedKey = $remote.Key
+            $script:attachedPort = $portState.Port
+
+            Write-Host ""
+            Write-Host "========================================"
+            Write-Host " USB ATTACHED TO WINDOWS"
+            Write-Host " Key : $($remote.Key)"
+            Write-Host " Port: $($script:attachedPort)"
+            Write-Host "========================================"
+
+            Show-UsbPnP "PnP after attach $($remote.Key)"
+            return $true
+          }
+
+          $end = (Get-Date).AddMinutes([int]$env:KEEP)
+
+          while ((Get-Date) -lt $end) {
+            if ($proc.HasExited) {
+              Get-Content $out -Tail 300 -ErrorAction SilentlyContinue
+              Get-Content $err -Tail 300 -ErrorAction SilentlyContinue
+              throw "Agent berhenti"
+            }
+
+            $deskProc.Refresh()
+            if ($deskProc.HasExited) {
+              Write-Warning "Native desktop host stopped; restarting in the same runtime step"
+              Get-Content $deskOut -Tail 200 -ErrorAction SilentlyContinue
+              Get-Content $deskErr -Tail 200 -ErrorAction SilentlyContinue
+              $deskProc = Start-NativeDesktopHost
+            }
+
+            $remote = Get-RemoteUsbState
+            $portState = Get-UsbIpPortState
+
+            if ($attached -and -not $portState.Active) {
+              Write-Host "USB/IP port vanished -> treating as DETACH"
+              Record-PresenceState "ABSENT" "USB/IP imported port vanished"
+              $attached = $false
+              $attachedKey = $null
+              $attachedPort = $null
+            }
+
+            if (-not $remote.Present) {
+              Record-PresenceState "ABSENT" "usbip DEVLIST reports no Android USB"
+              if ($attached -or $portState.Active) {
+                $transition++
+                Detach-UsbIpPort "Android physical USB disappeared (transition #$transition)"
+              }
+
+              if ($lastSeenKey -ne $null) {
+                Write-Host "HOTPLUG: device disappeared: $lastSeenKey"
+                $lastSeenKey = $null
+                Show-UsbPnP "PnP after physical detach"
+              }
+
+              Write-Host "WAITING FOR ANDROID USB..."
+            }
+            else {
+              Record-PresenceState "PRESENT" "usbip DEVLIST reports $($remote.Key)"
+              if ($lastSeenKey -ne $remote.Key) {
+                $transition++
+
+                Write-Host ""
+                Write-Host "========================================"
+                Write-Host " HOTPLUG / RE-ENUMERATION #$transition"
+                Write-Host " Previous: $lastSeenKey"
+                Write-Host " Current : $($remote.Key)"
+                Write-Host "========================================"
+
+                if ($attached -or $portState.Active) {
+                  Detach-UsbIpPort "USB identity changed: $attachedKey -> $($remote.Key)"
+                }
+
+                $lastSeenKey = $remote.Key
+              }
+
+              if ($attached -and $attachedKey -ne $remote.Key) {
+                Detach-UsbIpPort "Attached identity no longer matches exported identity"
+              }
+
+              if (-not $attached) {
+                [void](Attach-RemoteUsb $remote)
+              }
+            }
+
+            Write-Host ""
+            Write-Host "=== $(Get-Date -Format o) ==="
+            Write-Host "Remote present : $($remote.Present)"
+            Write-Host "Remote key     : $($remote.Key)"
+            Write-Host "Attached       : $attached"
+            Write-Host "Attached key   : $attachedKey"
+            Write-Host "Attached port  : $attachedPort"
+            Write-Host "Transitions    : $transition"
+            Write-Host "Presence state : $presenceState"
+            Write-Host "Hotplug PASS   : $hotplugPass"
+            Write-Host "State history  :"
+            if ($stateHistory.Count -eq 0) {
+              Write-Host "  (none yet)"
+            } else {
+              $stateHistory | Select-Object -Last 8 | ForEach-Object { Write-Host "  $_" }
+            }
+
+            Get-Content $out -Tail 80 -ErrorAction SilentlyContinue
+            Get-Content $err -Tail 60 -ErrorAction SilentlyContinue
+            Get-Content $deskOut -Tail 30 -ErrorAction SilentlyContinue
+            Get-Content $deskErr -Tail 30 -ErrorAction SilentlyContinue
+
+            Start-Sleep 1
+          }
+
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          Stop-Process -Id $deskProc.Id -Force -ErrorAction SilentlyContinue
